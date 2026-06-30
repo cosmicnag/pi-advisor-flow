@@ -408,7 +408,23 @@ function showStatus(ctx: ExtensionCommandContext): void {
 	lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
 	lines.push(`Context window: ~${config.contextChars} chars · max ${config.maxToolRounds} tool rounds${config.cooldownMs > 0 ? ` · cooldown ${config.cooldownMs}ms` : ""}`);
 	lines.push(`Delivery: ${config.interrupting ? "ALL advice interrupts" : "nit → non-interrupting, concern/blocker → interrupting"} (steer${config.interrupting ? " + triggerTurn" : " + triggerTurn for concern/blocker"})`);
-	lines.push(`Sync lag: ${config.syncLag === 0 ? "off (advisor reviews in background)" : `wait when ≥ ${config.syncLag} turn(s) behind`}`);
+
+	// Sync lag: show the setting, the live backlog (if the runtime has started),
+	// and a one-line recommendation so the value is actionable at a glance.
+	// Rationale: sync=0 (fire-and-forget) is the recommended default — the
+	// advisor's interrupting advice already pulls the agent on urgent notes, and
+	// waiting every turn doubles wall-clock when the advisor is a slow / strong
+	// model. sync=2 is the sweet spot for long unattended runs (catches a wrong
+	// direction before the next step); sync=1 only pays off with a fast advisor.
+	const syncHint = config.syncLag === 0
+		? "off — advisor reviews in background (default; recommended unless on a long run)"
+		: config.syncLag === 1
+			? "on — waits after every turn (fully sync; only worth it with a fast advisor model)"
+			: `on — pauses when ≥ ${config.syncLag} turns behind (good for long unattended runs; try 2)`;
+	lines.push(`Sync lag: ${syncHint}`);
+	if (runtime) {
+		lines.push(`  backlog now: ${runtime.lag} turn(s)${runtime.isBusy ? " (review in flight)" : ""}`);
+	}
 
 	const active = config.enabled && !!config.advisorModel;
 	lines.push(`Active: ${active ? "yes" : "no"}`);
