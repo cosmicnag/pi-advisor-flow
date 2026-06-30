@@ -80,6 +80,36 @@ describe("normalizeConfig", () => {
 	});
 });
 
+describe("syncLag", () => {
+	it("defaults to 0 (off — advisor reviews in the background)", () => {
+		expect(DEFAULT_CONFIG.syncLag).toBe(0);
+		expect(normalizeConfig(null).syncLag).toBe(0);
+	});
+
+	it("accepts a valid value 0-6", () => {
+		expect(normalizeConfig({ syncLag: 0 }).syncLag).toBe(0);
+		expect(normalizeConfig({ syncLag: 1 }).syncLag).toBe(1);
+		expect(normalizeConfig({ syncLag: 6 }).syncLag).toBe(6);
+	});
+
+	it("clamps values above 6 down to 6", () => {
+		expect(normalizeConfig({ syncLag: 99 }).syncLag).toBe(6);
+	});
+
+	it("clamps negative values up to 0", () => {
+		expect(normalizeConfig({ syncLag: -3 }).syncLag).toBe(0);
+	});
+
+	it("floors fractional values", () => {
+		expect(normalizeConfig({ syncLag: 2.7 }).syncLag).toBe(2);
+	});
+
+	it("ignores a non-number syncLag (stays at default)", () => {
+		expect(normalizeConfig({ syncLag: "high" as unknown as number }).syncLag).toBe(0);
+		expect(normalizeConfig({ syncLag: NaN }).syncLag).toBe(0);
+	});
+});
+
 describe("isInterruptingSeverity", () => {
 	it("nit is non-interrupting", () => {
 		expect(isInterruptingSeverity("nit")).toBe(false);

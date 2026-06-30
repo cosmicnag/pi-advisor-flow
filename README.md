@@ -142,7 +142,7 @@ This is the [pi extension](https://github.com/earendil-works/pi-coding-agent) po
 | hard-isolated read-only toolset (`read` / `search` / `find`) on a distinct `ToolSession` | `src/tools.ts` — re-implemented `read` / `grep` / `find` against the filesystem, read-only by construction, confined to the project root |
 | per-turn transcript delta via `formatSessionHistoryMarkdown`, advisor's own notes filtered out | `src/transcript.ts` — the `turn_end` event payload (`message` + `toolResults`) serialized via pi's public `convertToLlm` + `serializeConversation`; a rolling char-bounded buffer in the runtime keeps cross-turn context; a hard delivery-time dedupe plus a recent-advice preamble prevent the advisor re-raising its own notes (B5). |
 | `nit` non-interrupting aside vs `concern`/`blocker` interrupting steer | `src/runtime.ts` `deliveryOptions()` → pi's `sendMessage` `deliverAs: "steer"` + `triggerTurn` |
-| `advisor.immuneTurns` / `syncBacklog` | not ported — pi's extension API doesn't expose the steering/yield internals those tune; reviews are fire-and-forget from `turn_end` instead |
+| `syncBacklog` pause-the-agent modes | not ported — pi's extension API doesn't expose the steering/yield internals those tune; reviews are fire-and-forget from `turn_end` instead. The bounded wait/catch-up behavior is recreated on top of pi's awaited `turn_start` hook via `/advisor sync` (see [`src/runtime.ts`](src/runtime.ts) `waitForCatchUp`) |
 
 ### What's different (and why)
 
@@ -150,7 +150,7 @@ This is the [pi extension](https://github.com/earendil-works/pi-coding-agent) po
 - **`completeSimple`, not `complete`.** The `reasoning`/thinking option is only honoured on the `streamSimple` path; the plain `stream` path ignores it. Importing `completeSimple` from `@earendil-works/pi-ai/compat`.
 - **Event payload + rolling buffer, not a branch diff.** Each `turn_end` hands the advisor that turn's `message` + `toolResults` (one turn, bounded by construction — no silent head-drop when many entries land in one cycle). A rolling char-bounded buffer in the runtime keeps the advisor's cross-turn context, replacing oh-my-pi's own append-only context (which the extension API can't reach). No cursor or stale-cursor fallback to maintain.
 - **Repeat guard (B5).** The advisor can't see its own prior advice, so a hard delivery-time dedupe (normalized key over recently-delivered notes) prevents repeats, and a compact "recent advice" preamble injected into the session-update header gives the model awareness — only when dedupe didn't fire, so it never re-anchors on its own filtered output.
-- **Fire-and-forget reviews.** A review kicked from `turn_end` runs in the background and never blocks the main agent; advice lands via `pi.sendMessage` when ready. (oh-my-pi's `syncBacklog` pause-the-agent modes aren't reproducible without access to the steering/yield internals.)
+- **Fire-and-forget by default.** A review kicked from `turn_end` runs in the background and never blocks the main agent; advice lands via `pi.sendMessage` when ready. Optionally enable `/advisor sync <1-6>` to pause the main loop at `turn_start` when the advisor falls `N` turns behind (bounded catch-up).
 - **Read-only tools re-implemented, not shared.** oh-my-pi builds its read/search/find against a distinct `ToolSession`. The extension API can't create a second tool session, so the read-only primitives are re-implemented directly against the filesystem — they are read-only by construction (no write/edit code path exists) and confined to the project root (paths escaping via `..` are rejected).
 
 ---
@@ -351,12 +351,13 @@ All control is via the single `/advisor` slash command in the TUI. Tab-completio
 | `/advisor status` | Show config + state: enabled/disabled, current model, thinking, window size, busy flag, and the last review result. |
 | `/advisor thinking <off\|minimal\|low\|medium\|high\|xhigh>` | Set the advisor's thinking effort (`off` disables thinking). |
 | `/advisor interrupting [on\|off]` | Toggle whether **ALL** advice — including `nit` — triggers a new agent turn immediately. **Default: on** (the agent acknowledges/acts on every note). Run with no arg to flip, or `on`/`off` to set explicitly. When off, `nit` lands as a non-interrupting note for the next turn while `concern`/`blocker` still interrupt. |
+| `/advisor sync [0-6]` | **Wait for the advisor to catch up** at the start of a turn when it has fallen `N` turns behind. **Default: 0** (never wait — the advisor reviews fully in the background, today's behavior). `1` = wait after every turn (fully synchronous). `2`-`6` = allow a bounded backlog so the agent keeps moving while the advisor catches up, only pausing once it falls `N` turns behind. The wait sits *between turns* (after the prior turn's tools finish, before the next LLM call) and is fully abortable (Ctrl+C, compaction, or session navigation cancels it), so a slow/dead advisor model can never hang the main agent. |
 | `/advisor review` | **Manually** re-review the recent transcript now and await the result (the only synchronous path). |
 | `/advisor help` | Print the command list. |
 
 **Enable / disable** and **model selection** are fully supported and persist to `~/.pi/agent/extensions/pi-advisor.json` (so they survive restarts). The advisor also re-reads the config on each `session_start`, so changes made from another window take effect.
 
-> **No "wait / catch-up" mode.** The advisor is strictly **fire-and-forget**: it reviews in the background after each turn and never blocks the main agent. If it falls behind, the main agent just keeps going — a late review still lands (via `pi.sendMessage`) whenever it finishes. By default `/advisor interrupting` is **on**, so any advice (even a `nit`) triggers a new turn immediately and the agent acknowledges/acts on it; run `/advisor interrupting off` to make `nit` land silently (visible only on the next turn) while `concern`/`blocker` still interrupt. Either way, there is no setting that makes the main loop *pause* for a backed-up advisor — the closest thing is the manual `/advisor review`, which awaits a single on-demand review.
+> **Wait / catch-up mode (`/advisor sync`).** By default (`syncLag: 0`) the advisor is **fire-and-forget**: it reviews in the background after each turn and never blocks the main agent — a late review still lands via `pi.sendMessage` whenever it finishes. Set `/advisor sync <1-6>` to make the main loop **pause at the `turn_start` boundary** when the advisor has fallen `N` turns behind (`N` = queued backlog + 1 if a review is in flight), resuming once it catches up below `N`. The gate sits *between turns*, so in-progress tool calls in the prior turn are never interrupted, and it's fully abortable — Ctrl+C, compaction, or session navigation cancels the wait, so a slow or dead advisor model can never hang the agent. This brings oh-my-pi's `syncBacklog` pause-the-agent behavior to pi via the awaited `turn_start` hook.
 
 ### Troubleshooting
 
@@ -412,6 +413,7 @@ Created automatically at `~/.pi/agent/extensions/pi-advisor.json` on first chang
   "maxToolRounds": 6,
   "maxRetries": 3,
   "interrupting": true,
+  "syncLag": 0,
   "systemPrompt": null
 }
 ```
@@ -425,6 +427,7 @@ Created automatically at `~/.pi/agent/extensions/pi-advisor.json` on first chang
 | `contextChars` | `12000` | Approximate char budget for the advisor's rolling context buffer of recent per-turn deltas. The oldest turn is evicted when exceeded, so cost stays bounded while the advisor keeps cross-turn context. (Replaces the old `contextEntries` count, which is still accepted from old config for back-compat.) |
 | `cooldownMs` | `0` | Minimum gap (ms) between reviews. `0` = review every `turn_end`. Set higher to throttle cost on a busy agent; turns inside the cooldown are coalesced into the next review, not dropped. |
 | `interrupting` | `true` | When `true`, ALL advice (including `nit`) triggers a new agent turn immediately. When `false`, only `concern`/`blocker` interrupt; `nit` lands non-interruptingly. A hard delivery-time dedupe guards against repeat-feedback loops either way. |
+| `syncLag` | `0` | How many turns the advisor may fall behind before the main agent **waits** at `turn_start`. `0` = never wait (fire-and-forget, today's default). `1` = wait after every turn. `2`-`6` = bounded backlog. Clamped to 0-6. The wait is fully abortable (Ctrl+C / compaction / tree-nav cancels it), so a slow advisor can't hang the agent. |
 | `maxToolRounds` | `6` | Max read-only tool rounds per review before the advisor must `advise` or yield. Hard-capped at 12. |
 | `maxRetries` | `3` | Max attempts to retry a failed review before dropping the backlog (mirrors oh-my-pi's 3-strike drop so a broken model never stalls the session). |
 | `systemPrompt` | _(built-in)_ | Override the advisor system prompt. |

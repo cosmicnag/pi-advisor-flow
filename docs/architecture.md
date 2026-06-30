@@ -78,7 +78,7 @@ On every primary `turn_end`, the extension takes a bounded slice of the session 
 
 | File | Layer | Responsibility |
 |---|---|---|
-| `advisor.ts` | **Wiring** | Subscribes to pi events (`turn_end`, `session_start`, `session_shutdown`), lazily builds the runtime, registers the `/advisor` command + model picker, routes subcommands. The only file that touches `ExtensionAPI`. |
+| `advisor.ts` | **Wiring** | Subscribes to pi events (`turn_end` to queue reviews, `turn_start` for the optional `/advisor sync` catch-up gate, `session_start`/`session_compact`/`session_tree`/`session_shutdown`), lazily builds the runtime, registers the `/advisor` command + model picker, routes subcommands. The only file that touches `ExtensionAPI`. |
 | `src/index.ts` | **Config/types** | Config schema + persistence (`~/.pi/agent/extensions/pi-advisor.json`), `provider/id` parsing, severity type, and the `<advisory>` framing (`formatAdvisorBatchContent`, `escapeXmlText`). No pi imports beyond `getAgentDir`. |
 | `src/prompts.ts` | **Prompt** | The advisor system prompt and `advise` tool description — **ported verbatim from oh-my-pi** (`prompts/advisor/system.md` + `advise-tool.md`). Defines the reviewer role: peer-programmer, not a second executor; can only read + advise. |
 | `src/tools.ts` | **Tools** | The advisor's hard-isolated read-only toolset: `read`, `grep`, `find` (re-implemented against the filesystem, read-only by construction — there is no write/edit capability at all — and confined to the project root) plus the `advise` tool that captures a note + severity. |
@@ -185,14 +185,14 @@ note text
 | hard-isolated read-only toolset (`read`/`search`/`find`) on a distinct `ToolSession` | `src/tools.ts` | Re-implemented against the filesystem; read-only by construction (no write/edit code path exists) and confined to the project root. |
 | per-turn transcript delta via `formatSessionHistoryMarkdown`, advisor's own notes filtered out | `src/transcript.ts` | Bounded trailing window via pi's public `convertToLlm` + `serializeConversation`; `<advisory>` entries filtered out. |
 | `nit` non-interrupting aside vs `concern`/`blocker` interrupting steer | `src/runtime.ts` `deliveryOptions()` | Mapped onto pi's `sendMessage` `deliverAs: "steer"` + `triggerTurn`. |
-| `advisor.immuneTurns` / `syncBacklog` | **not ported** | pi's extension API doesn't expose the steering/yield internals those tune; reviews are fire-and-forget from `turn_end` instead. |
+| `advisor.immuneTurns` / `syncBacklog` | **recreated** | pi's extension API doesn't expose the steering/yield internals those tune, so reviews are fire-and-forget from `turn_end` by default. The bounded pause-the-agent behavior is recreated on top of pi's awaited `turn_start` hook via `/advisor sync` (`src/runtime.ts` `waitForCatchUp`). |
 
 ### Key adaptations (and why)
 
 - **No second `Agent`.** oh-my-pi's advisor is a full `Agent` with its own append-only context, telemetry, and tool loop. The public pi extension API doesn't expose `Agent`, so the advisor loop is reimplemented with pi-ai's `completeSimple()`.
 - **`completeSimple`, not `complete`.** The `reasoning`/thinking option is only honoured on the `streamSimple` path; the plain `stream` path ignores it. Importing `completeSimple` from `@earendil-works/pi-ai/compat`.
 - **Bounded recent window, not a byte-delta.** oh-my-pi feeds only the per-turn delta (rendered with its internal markdown formatter). This extension can't reach that formatter, so it sends a bounded trailing transcript window via pi's public helpers (the same ones pi's own `handoff` example uses). Slicing whole entries keeps assistant/toolCall + toolResult pairs intact.
-- **Fire-and-forget reviews.** A review kicked from `turn_end` runs in the background and never blocks the main agent; advice lands via `pi.sendMessage` when ready.
+- **Fire-and-forget by default.** A review kicked from `turn_end` runs in the background and never blocks the main agent; advice lands via `pi.sendMessage` when ready. Optionally `/advisor sync <1-6>` makes the main loop pause at the awaited `turn_start` hook when the advisor falls `N` turns behind (bounded catch-up; fully abortable).
 - **Read-only tools re-implemented, not shared.** oh-my-pi builds its read/search/find against a distinct `ToolSession`. The extension API can't create a second tool session, so the read-only primitives are re-implemented directly against the filesystem — read-only by construction and confined to the project root.
 
 ---

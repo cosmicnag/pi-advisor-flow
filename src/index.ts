@@ -139,6 +139,14 @@ export interface AdvisorConfig {
 	 *  interrupt; `nit` lands as a non-interrupting note visible on the next
 	 *  turn. Toggled with `/advisor interrupting`. */
 	interrupting: boolean;
+	/** How far the advisor may fall behind (in turns) before the main agent
+	 *  WAITS for it to catch up at the `turn_end` boundary. 0 = never wait (the
+	 *  advisor reviews fully in the background; today's default). 1 = the agent
+	 *  waits after every turn for that turn's review (fully synchronous). 2..6
+	 *  allow a bounded backlog so the agent keeps moving while the advisor
+	 *  catches up, only pausing when it falls `syncLag` turns behind. Clamped to
+	 *  0..6. See `/advisor sync`. */
+	syncLag: number;
 	/** Override the advisor system prompt. Defaults to the built-in prompt. */
 	systemPrompt?: string;
 }
@@ -153,6 +161,7 @@ export const DEFAULT_CONFIG: AdvisorConfig = {
 	maxToolRounds: 6,
 	maxRetries: 3,
 	interrupting: true,
+	syncLag: 0,
 };
 
 const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
@@ -222,6 +231,12 @@ export function normalizeConfig(raw: unknown): AdvisorConfig {
 		base.maxRetries = Math.floor(obj.maxRetries);
 	}
 	if (typeof obj.interrupting === "boolean") base.interrupting = obj.interrupting;
+	if (
+		typeof obj.syncLag === "number" &&
+		Number.isFinite(obj.syncLag)
+	) {
+		base.syncLag = Math.min(6, Math.max(0, Math.floor(obj.syncLag)));
+	}
 	if (typeof obj.systemPrompt === "string" && obj.systemPrompt.trim()) {
 		base.systemPrompt = obj.systemPrompt;
 	}

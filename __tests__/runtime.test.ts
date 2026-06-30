@@ -97,7 +97,7 @@ const FAKE_MODEL: Model<Api> = {
 function makeRuntime(
 	review: ReviewFn,
 	branch: SessionEntry[] = [],
-	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number }> = {},
+	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number; syncLag: number }> = {},
 ) {
 	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string) => {});
 	const host = { sendAdvice };
@@ -113,6 +113,7 @@ function makeRuntime(
 			maxToolRounds: 6,
 			maxRetries: config.maxRetries ?? 3,
 			interrupting: true,
+			syncLag: config.syncLag ?? 0,
 		},
 		review as never,
 	);
@@ -342,5 +343,113 @@ describe("AdvisorRuntime — cooldown (D3)", () => {
 		await settle(rt);
 		expect(seen).toHaveLength(1); // second turn coalesced, not reviewed
 		expect(sendAdvice).not.toHaveBeenCalled();
+	});
+});
+
+describe("AdvisorRuntime — lag (sync backlog metric)", () => {
+	it("lag is 0 when idle with no backlog", async () => {
+		const { rt } = makeRuntime(async () => ({ advise: null, rounds: 0 }));
+		expect(rt.lag).toBe(0);
+	});
+
+	it("lag counts the in-flight review as 1 (the +1, since it was shifted out of #pending)", async () => {
+		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>(() => {})); // never resolves
+		const t = turn("x");
+		void rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(rt.isBusy).toBe(true);
+		// In-flight review was shifted out of #pending; lag must still count it.
+		expect(rt.lag).toBe(1);
+	});
+
+	it("lag counts queued backlog + an in-flight review", async () => {
+		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>(() => {}));
+		for (let i = 0; i < 4; i++) {
+			const ti = turn(`turn-${i}`);
+			void rt.onTurnEnd(ti.message as AgentMessage, ti.toolResults, [entry("user", `turn-${i}`)], ctx);
+		}
+		await new Promise((r) => setTimeout(r, 15));
+		// One review in flight, three queued behind it.
+		expect(rt.lag).toBe(4);
+	});
+});
+
+describe("AdvisorRuntime — waitForCatchUp (sync gate)", () => {
+	it("returns immediately when threshold <= 0 (the disable path)", async () => {
+		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>(() => {}));
+		const t = turn("x");
+		void rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(rt.lag).toBe(1);
+		// threshold 0 = never wait, returns instantly even with backlog.
+		await expect(rt.waitForCatchUp(0, ctx.signal)).resolves.toBeUndefined();
+	});
+
+	it("returns immediately when not lagging (lag < threshold)", async () => {
+		const { rt } = makeRuntime(async () => ({ advise: null, rounds: 0 }));
+		expect(rt.lag).toBe(0);
+		await expect(rt.waitForCatchUp(2)).resolves.toBeUndefined();
+	});
+
+	it("resolves once the advisor catches up below the threshold", async () => {
+		let resolveReview: (r: AdvisorReviewResult) => void = () => {};
+		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>((res) => { resolveReview = res; }));
+		const t = turn("x");
+		void rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(rt.lag).toBe(1);
+
+		let resolved = false;
+		const p = rt.waitForCatchUp(1).then(() => { resolved = true; });
+		await new Promise((r) => setTimeout(r, 20));
+		expect(resolved).toBe(false); // still lagging (1 >= 1)
+
+		resolveReview({ advise: null, rounds: 0 });
+		await p;
+		expect(resolved).toBe(true);
+		expect(rt.lag).toBe(0);
+	});
+
+	it("unblocks when a Ctrl+C-style caller signal aborts (never hangs the agent)", async () => {
+		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>(() => {}));
+		const t = turn("x");
+		void rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(rt.lag).toBe(1);
+
+		const caller = new AbortController();
+		let resolved = false;
+		const p = rt.waitForCatchUp(1, caller.signal).then(() => { resolved = true; });
+		await new Promise((r) => setTimeout(r, 20));
+		expect(resolved).toBe(false);
+
+		caller.abort();
+		await p;
+		expect(resolved).toBe(true);
+	});
+
+	it("unblocks when reset() clears the queue mid-wait (epoch bumped)", async () => {
+		let resolveReview: (r: AdvisorReviewResult) => void = () => {};
+		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>((res) => { resolveReview = res; }));
+		for (let i = 0; i < 4; i++) {
+			const ti = turn(`turn-${i}`);
+			void rt.onTurnEnd(ti.message as AgentMessage, ti.toolResults, [entry("user", `turn-${i}`)], ctx);
+		}
+		await new Promise((r) => setTimeout(r, 15));
+		expect(rt.lag).toBe(4); // 1 in flight + 3 queued
+
+		let resolved = false;
+		const p = rt.waitForCatchUp(1).then(() => { resolved = true; });
+		await new Promise((r) => setTimeout(r, 20));
+		expect(resolved).toBe(false);
+
+		rt.reset(); // compaction/tree-nav-equivalent: clears backlog + bumps epoch
+		// reset aborted the lifecycle signal; in production that aborts the
+		// in-flight completeSimple call. The signal-ignoring test review fn can't
+		// model that, so resolve it manually to let the drain settle and #busy flip.
+		resolveReview({ advise: null, rounds: 0, error: "aborted" });
+		await p;
+		expect(resolved).toBe(true);
+		expect(rt.lag).toBe(0);
 	});
 });

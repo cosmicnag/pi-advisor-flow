@@ -139,6 +139,47 @@ export class AdvisorRuntime {
 		return this.#lastAdvisorModel;
 	}
 
+	/** How many turns the advisor is behind the main agent right now: the queued
+	 *  backlog plus one if a review is currently in flight (the in-flight batch
+	 *  was already `shift()`ed out of `#pending`, so the +1 counts it). This is
+	 *  the backpressure metric `syncLag` gates against. Cooldown-coalesced turns
+	 *  (the early `return` in `#queueReview`) intentionally don't enqueue, so
+	 *  they don't count as lag — they're folded into the next review's buffer. */
+	get lag(): number {
+		return this.#pending.length + (this.#busy ? 1 : 0);
+	}
+
+	/** Wait until the advisor has caught up to within `threshold` turns (i.e.
+	 *  `lag < threshold`), or until the wait is aborted/cancelled by a reset,
+	 *  dispose, or the caller's signal. Used by the `turn_start` gate so the
+	 *  main agent pauses before its next turn when the advisor has fallen
+	 *  `syncLag` turns behind.
+	 *
+	 *  - `threshold <= 0`: never waits (returns immediately). This is the disable
+	 *    path for `syncLag`.
+	 *  - The wait resolves the moment `lag` drops below `threshold`; it polls on
+	 *    a short interval rather than spinning.
+	 *  - It is fully abortable: the lifecycle controller (reset/dispose/compact/
+	 *    tree-nav) and the caller's per-turn signal (Ctrl+C) both cancel it, so a
+	 *    slow/dead advisor model can never hang the main agent irrecoverably.
+	 *    The epoch is re-checked on resume so the wait never blocks on a queue
+	 *    that was just cleared by a reset. */
+	async waitForCatchUp(threshold: number, signal?: AbortSignal): Promise<void> {
+		if (threshold <= 0) return;
+		if (this.lag < threshold) return;
+		const composed = this.#adoptSignal(signal);
+		const startEpoch = this.#epoch;
+		while (!this.disposed && this.lag >= threshold) {
+			// A reset/compact/tree-nav bumped the epoch: the backlog was cleared, so
+			// there's nothing left to wait for. Stop instead of blocking on a queue
+			// that no longer exists.
+			if (this.#epoch !== startEpoch) return;
+			if (composed.aborted) return;
+			const abort = await abortableDelay(CATCHUP_POLL_MS, composed);
+			if (abort || this.#epoch !== startEpoch) return;
+		}
+	}
+
 	/** Called on each primary turn_end. Serializes the turn's payload, queues it,
 	 *  and kicks the drain. */
 	onTurnEnd(
@@ -392,6 +433,12 @@ export class AdvisorRuntime {
 		return { provider: ref.slice(0, i), id: ref.slice(i + 1) };
 	}
 }
+
+/** Poll interval for {@link AdvisorRuntime.waitForCatchUp}. Short enough to feel
+ *  responsive when a review finishes, long enough to avoid busy-waiting in the
+ *  `turn_start` gate. Globals are used (not module-closure) so test monkeypatches
+ *  of globalThis.setTimeout apply. */
+const CATCHUP_POLL_MS = 50;
 
 /** A delay that resolves to `true` if `signal` aborted before the timeout, else
  *  `false`. Used for the retry backoff so dispose/reset cancels it (B2). */

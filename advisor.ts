@@ -80,6 +80,22 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
+	// Sync gate: at the start of each turn, if the advisor has fallen `syncLag`
+	// turns behind, WAIT for it to catch up before the main agent proceeds. pi
+	// awaits turn_start handlers, so this blocks the next LLM turn until the
+	// advisor's backlog is below the threshold. The wait is fully abortable
+	// (composed with the lifecycle controller + the per-turn Ctrl+C signal) so a
+	// slow/dead advisor model can't hang the agent. syncLag = 0 (default) => never
+	// waits; the gate returns immediately and the advisor keeps reviewing fully
+	// in the background (today's behavior). Sits between turns, so in-progress
+	// tool calls in the prior turn were never interrupted.
+	pi.on("turn_start", async (_event, ctx) => {
+		if (!config.enabled || !config.advisorModel) return;
+		if (config.syncLag <= 0) return;
+		const rt = ensureRuntime(pi);
+		await rt.waitForCatchUp(config.syncLag, ctx.signal);
+	});
+
 	// G2: compaction and tree navigation rewrite the branch. Bump the epoch so any
 	// in-flight review is dropped instead of landing stale against the new
 	// conversation, and clear the rolling context buffer.
@@ -98,7 +114,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("advisor", {
 		description: ADVISOR_COMMAND_DESCRIPTION,
 		getArgumentCompletions(prefix: string) {
-			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "help", "review"];
+			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "sync", "help", "review"];
 			const matches = subs.filter((s) => s.startsWith(prefix));
 			return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
 		},
@@ -132,6 +148,8 @@ async function handleAdvisorCommand(
 				"  /advisor enable        Enable the advisor",
 				"  /advisor disable       Disable the advisor (keeps the model)",
 				"  /advisor interrupting [on|off]  Toggle whether ALL advice interrupts (default: on)",
+			"  /advisor sync [0-6]          Wait for the advisor when it falls N turns behind",
+			"                                (0 = never wait, default; 1 = after every turn)",
 				"  /advisor thinking <off|minimal|low|medium|high|xhigh>",
 				"                          Set the advisor's thinking effort (off = disabled)",
 				"  /advisor review        Re-review the recent transcript now",
@@ -168,6 +186,11 @@ async function handleAdvisorCommand(
 
 	if (sub === "interrupting") {
 		handleInterrupting(ctx, rest);
+		return;
+	}
+
+	if (sub === "sync") {
+		handleSync(ctx, rest);
 		return;
 	}
 
@@ -288,6 +311,34 @@ function handleInterrupting(ctx: ExtensionCommandContext, rest: string): void {
 	ctx.ui.notify(`Usage: /advisor interrupting [on|off]. Current: ${config.interrupting ? "on" : "off"}.`, "warning");
 }
 
+/** Set how far the advisor may fall behind (in turns) before the main agent
+ *  WAITS for it at the `turn_start` boundary. 0 = never wait (default, advisor
+ *  reviews fully in the background); 1 = wait after every turn (synchronous);
+ *  2..6 = allow a bounded backlog. Clamped to 0..6. */
+function handleSync(ctx: ExtensionCommandContext, rest: string): void {
+	const arg = rest.trim().toLowerCase();
+	if (!arg) {
+		ctx.ui.notify(
+			`Sync lag: ${config.syncLag} turn(s).\n` +
+				`Usage: /advisor sync <0-6>  (0 = never wait, 1 = after every turn, 2-6 = bounded backlog)`,
+			"info",
+		);
+		return;
+	}
+	const n = Number(arg);
+	if (!Number.isFinite(n) || n < 0 || n > 6 || !Number.isInteger(n)) {
+		ctx.ui.notify(`Invalid sync lag: "${arg}". Use an integer 0-6 (0 = off).`, "error");
+		return;
+	}
+	updateConfig(
+		ctx,
+		(c) => ({ ...c, syncLag: n }),
+		n === 0
+			? `Advisor sync off — advisor reviews in the background.`
+			: `Advisor sync on — main agent waits when the advisor falls ${n} turn(s) behind.`,
+	);
+}
+
 /** Interactive model picker. Lists every available (auth-configured) model,
  *  reasoning-capable and currently-selected ones first. */
 async function showPicker(ctx: ExtensionCommandContext): Promise<void> {
@@ -357,6 +408,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
 	lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
 	lines.push(`Context window: ~${config.contextChars} chars · max ${config.maxToolRounds} tool rounds${config.cooldownMs > 0 ? ` · cooldown ${config.cooldownMs}ms` : ""}`);
 	lines.push(`Delivery: ${config.interrupting ? "ALL advice interrupts" : "nit → non-interrupting, concern/blocker → interrupting"} (steer${config.interrupting ? " + triggerTurn" : " + triggerTurn for concern/blocker"})`);
+	lines.push(`Sync lag: ${config.syncLag === 0 ? "off (advisor reviews in background)" : `wait when ≥ ${config.syncLag} turn(s) behind`}`);
 
 	const active = config.enabled && !!config.advisorModel;
 	lines.push(`Active: ${active ? "yes" : "no"}`);
