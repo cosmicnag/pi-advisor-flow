@@ -295,7 +295,24 @@ describe("AdvisorRuntime — epoch guards / reset", () => {
 });
 
 describe("AdvisorRuntime — rolling context buffer", () => {
-	it("seedToLeaf clears the buffer so old turns are not replayed", async () => {
+	it("includes each new user prompt before the assistant turn and does not duplicate it", async () => {
+		const seenTexts: string[] = [];
+		const { rt, ctx } = makeRuntime(async (text: string) => { seenTexts.push(text); return { advise: null, rounds: 0 }; });
+		const user = entry("user", "Use PostgreSQL and keep the public API stable");
+		const first = turn("I will update the storage layer");
+		void rt.onTurnEnd(first.message as AgentMessage, first.toolResults, [user], ctx);
+		await settle(rt);
+		const second = turn("Storage changes are complete");
+		void rt.onTurnEnd(second.message as AgentMessage, second.toolResults, [user], ctx);
+		await settle(rt);
+
+		expect(seenTexts).toHaveLength(2);
+		expect(seenTexts[0]).toContain("Use PostgreSQL and keep the public API stable");
+		expect(seenTexts[0].indexOf("Use PostgreSQL")).toBeLessThan(seenTexts[0].indexOf("update the storage layer"));
+		expect(seenTexts[1].match(/Use PostgreSQL/g)).toHaveLength(1);
+	});
+
+	it("seedToLeaf clears the buffer so old turns and old user prompts are not replayed", async () => {
 		const seenTexts: string[] = [];
 		const { rt, ctx } = makeRuntime(async (text: string) => { seenTexts.push(text); return { advise: null, rounds: 0 }; });
 		rt.seedToLeaf([entry("user", "old1"), entry("assistant", "old2")]);

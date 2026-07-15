@@ -32,7 +32,11 @@ import type {
 import {
 	ADVISOR_COMMAND_DESCRIPTION,
 	formatModelRef,
+	MAX_CONTEXT_CHARS,
+	MIN_CONTEXT_CHARS,
+	parseAdvisorContextSize,
 	parseModelRef,
+	RECOMMENDED_CONTEXT_CHARS,
 	readConfig,
 	writeConfig,
 	type AdvisorConfig,
@@ -79,6 +83,7 @@ export default function (pi: ExtensionAPI) {
 		// so the advisor only reviews new turns going forward.
 		const rt = ensureRuntime(pi);
 		rt.reset();
+		rt.seedToLeaf(ctx.sessionManager.getBranch());
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -112,11 +117,13 @@ export default function (pi: ExtensionAPI) {
 	// G2: compaction and tree navigation rewrite the branch. Bump the epoch so any
 	// in-flight review is dropped instead of landing stale against the new
 	// conversation, and clear the rolling context buffer.
-	pi.on("session_compact", async () => {
+	pi.on("session_compact", async (_event, ctx) => {
 		runtime?.reset();
+		runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 	});
-	pi.on("session_tree", async () => {
+	pi.on("session_tree", async (_event, ctx) => {
 		runtime?.reset();
+		runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -127,7 +134,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("advisor", {
 		description: ADVISOR_COMMAND_DESCRIPTION,
 		getArgumentCompletions(prefix: string) {
-			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "sync", "instructions", "help", "review"];
+			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "sync", "context", "instructions", "help", "review"];
 			const matches = subs.filter((s) => s.startsWith(prefix));
 			return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
 		},
@@ -163,6 +170,8 @@ async function handleAdvisorCommand(
 				"  /advisor interrupting [on|off]  Toggle whether ALL advice interrupts (default: on)",
 			"  /advisor sync [0-6]          Wait for the advisor when it falls N turns behind",
 			"                                (0 = never wait, default; 1 = after every turn)",
+				"  /advisor context [chars|Nk|default]",
+				"                          Set rolling transcript size (default: 24k chars)",
 				"  /advisor thinking <off|minimal|low|medium|high|xhigh>",
 				"                          Set the advisor's thinking effort (off = disabled)",
 				"  /advisor instructions [show|set <text>|edit|clear]",
@@ -207,6 +216,11 @@ async function handleAdvisorCommand(
 
 	if (sub === "sync") {
 		handleSync(ctx, rest);
+		return;
+	}
+
+	if (sub === "context" || sub === "window") {
+		handleContext(ctx, rest);
 		return;
 	}
 
@@ -278,6 +292,7 @@ function updateConfig(
 	const rt = runtime;
 	if (rt) {
 		rt.reset();
+		rt.seedToLeaf(ctx.sessionManager.getBranch());
 	}
 	ctx.ui.notify(`${message} (config: ${path})`, "info");
 }
@@ -303,6 +318,7 @@ async function handleInstructions(ctx: ExtensionCommandContext, rest: string): P
 		if (action === "clear" || action === "remove" || action === "reset") {
 			writeProjectInstructions(ctx.cwd, "");
 			runtime?.reset();
+			runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 			ctx.ui.notify(`Cleared project advisor instructions. (${path})`, "info");
 			return;
 		}
@@ -315,6 +331,7 @@ async function handleInstructions(ctx: ExtensionCommandContext, rest: string): P
 			}
 			writeProjectInstructions(ctx.cwd, text);
 			runtime?.reset();
+			runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 			ctx.ui.notify(`Saved project advisor instructions. (${path})`, "info");
 			return;
 		}
@@ -333,6 +350,7 @@ async function handleInstructions(ctx: ExtensionCommandContext, rest: string): P
 			const normalized = edited.trim();
 			writeProjectInstructions(ctx.cwd, normalized);
 			runtime?.reset();
+			runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 			ctx.ui.notify(normalized ? `Saved project advisor instructions. (${path})` : `Cleared project advisor instructions. (${path})`, "info");
 			return;
 		}
@@ -340,6 +358,7 @@ async function handleInstructions(ctx: ExtensionCommandContext, rest: string): P
 		// Friendly shorthand: `/advisor instructions prefer tests first`.
 		writeProjectInstructions(ctx.cwd, input);
 		runtime?.reset();
+		runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 		ctx.ui.notify(`Saved project advisor instructions. (${path})`, "info");
 	} catch (error) {
 		ctx.ui.notify(`Could not update advisor instructions: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -394,6 +413,35 @@ function handleInterrupting(ctx: ExtensionCommandContext, rest: string): void {
 		return;
 	}
 	ctx.ui.notify(`Usage: /advisor interrupting [on|off]. Current: ${config.interrupting ? "on" : "off"}.`, "warning");
+}
+
+/** Configure the rolling transcript window. Accepts raw chars or k suffix. */
+function handleContext(ctx: ExtensionCommandContext, rest: string): void {
+	const arg = rest.trim().toLowerCase();
+	if (!arg) {
+		ctx.ui.notify(
+			`Advisor context: ${config.contextChars.toLocaleString()} characters (~${Math.round(config.contextChars / 4).toLocaleString()} tokens).\n` +
+				`Recommended/default: ${RECOMMENDED_CONTEXT_CHARS.toLocaleString()} characters.\n` +
+				`Usage: /advisor context <chars|Nk|default>  (range ${MIN_CONTEXT_CHARS.toLocaleString()}-${MAX_CONTEXT_CHARS.toLocaleString()})`,
+			"info",
+		);
+		return;
+	}
+
+	const chars = parseAdvisorContextSize(arg);
+	if (chars === null) {
+		ctx.ui.notify(
+			`Context size must be between ${MIN_CONTEXT_CHARS.toLocaleString()} and ${MAX_CONTEXT_CHARS.toLocaleString()} characters.`,
+			"error",
+		);
+		return;
+	}
+
+	updateConfig(
+		ctx,
+		(c) => ({ ...c, contextChars: chars }),
+		`Advisor context set to ${chars.toLocaleString()} characters (~${Math.round(chars / 4).toLocaleString()} tokens).`,
+	);
 }
 
 /** Set how far the advisor may fall behind (in turns) before the main agent
@@ -494,7 +542,7 @@ function showStatus(ctx: ExtensionCommandContext): void {
 	const projectTrusted = ctx.isProjectTrusted();
 	const instructions = projectInstructions(ctx.cwd, projectTrusted);
 	lines.push(`Project instructions: ${projectTrusted ? (instructions ? `active (${instructions.length} chars)` : "none") : "ignored (project not trusted)"} (${getProjectInstructionsPath(ctx.cwd)})`);
-	lines.push(`Context window: ~${config.contextChars} chars · max ${config.maxToolRounds} tool rounds${config.cooldownMs > 0 ? ` · cooldown ${config.cooldownMs}ms` : ""}`);
+	lines.push(`Context window: ~${config.contextChars.toLocaleString()} chars (~${Math.round(config.contextChars / 4).toLocaleString()} tokens) · max ${config.maxToolRounds} tool rounds${config.cooldownMs > 0 ? ` · cooldown ${config.cooldownMs}ms` : ""}`);
 	lines.push(`Delivery: ${config.interrupting ? "ALL advice interrupts" : "nit → non-interrupting, concern/blocker → interrupting"} (steer${config.interrupting ? " + triggerTurn" : " + triggerTurn for concern/blocker"})`);
 
 	// Sync lag: show the setting, the live backlog (if the runtime has started),

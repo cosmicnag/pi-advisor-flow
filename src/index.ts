@@ -151,12 +151,34 @@ export interface AdvisorConfig {
 	systemPrompt?: string;
 }
 
+/** Recommended rolling transcript budget: about 6k tokens for typical code/chat. */
+export const RECOMMENDED_CONTEXT_CHARS = 24_000;
+/** Bounds accepted by config and `/advisor context`. */
+export const MIN_CONTEXT_CHARS = 512;
+export const MAX_CONTEXT_CHARS = 200_000;
+
+/** Parse a user-facing context size such as `24000`, `24k`, or `default`. */
+export function parseAdvisorContextSize(value: string): number | null {
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "default" || normalized === "recommended" || normalized === "reset") {
+		return RECOMMENDED_CONTEXT_CHARS;
+	}
+	const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(k|kb|m|mb)?$/);
+	if (!match) return null;
+	const multiplier = match[2]?.startsWith("m") ? 1_000_000 : match[2] ? 1_000 : 1;
+	const chars = Math.floor(Number(match[1]) * multiplier);
+	if (!Number.isSafeInteger(chars) || chars < MIN_CONTEXT_CHARS || chars > MAX_CONTEXT_CHARS) {
+		return null;
+	}
+	return chars;
+}
+
 export const DEFAULT_CONFIG: AdvisorConfig = {
 	enabled: true,
 	advisorModel: null,
 	thinking: false,
 	thinkingLevel: "medium",
-	contextChars: 12_000,
+	contextChars: RECOMMENDED_CONTEXT_CHARS,
 	cooldownMs: 0,
 	maxToolRounds: 6,
 	maxRetries: 3,
@@ -204,10 +226,12 @@ export function normalizeConfig(raw: unknown): AdvisorConfig {
 	// back-compat but no longer read (replaced by contextChars). Swallow it here.
 	if (
 		typeof obj.contextChars === "number" &&
-		Number.isFinite(obj.contextChars) &&
-		obj.contextChars >= 512
+		Number.isFinite(obj.contextChars)
 	) {
-		base.contextChars = Math.floor(obj.contextChars);
+		base.contextChars = Math.min(
+			MAX_CONTEXT_CHARS,
+			Math.max(MIN_CONTEXT_CHARS, Math.floor(obj.contextChars)),
+		);
 	}
 	if (
 		typeof obj.cooldownMs === "number" &&

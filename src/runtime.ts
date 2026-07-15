@@ -90,6 +90,8 @@ export class AdvisorRuntime {
 	 *  API can't reach) with a cheap char-bounded approximation. */
 	#contextBuffer: string[] = [];
 	#contextChars = 0;
+	/** User session entries already copied into the rolling advisor context. */
+	#seenUserEntryIds = new Set<string>();
 
 	/** Ring of recently-delivered advice (dedupe + awareness). */
 	#recentAdvice: AdvisorNote[] = [];
@@ -200,9 +202,10 @@ export class AdvisorRuntime {
 		if (!this.config.enabled || !this.config.advisorModel) return Promise.resolve();
 
 		const serialized = serializeTurn(message, toolResults);
-		// Advance the rolling context buffer regardless of whether this turn had
-		// conversational content, so the advisor's window tracks the live session.
-		void branch; // branch no longer drives the delta; kept for API stability.
+		// Copy newly-arrived user prompts from the authoritative session branch
+		// before this assistant turn. turn_end itself only carries the assistant
+		// message + tool results, so without this the advisor must infer intent.
+		this.#captureNewUserMessages(branch);
 		if (serialized) {
 			this.#pushContext(serialized);
 		}
@@ -221,6 +224,16 @@ export class AdvisorRuntime {
 		return buildSessionUpdate(body, preamble);
 	}
 
+	/** Add each new user prompt exactly once, preserving branch order. */
+	#captureNewUserMessages(branch: SessionEntry[]): void {
+		for (const entry of branch) {
+			if (entry.type !== "message" || entry.message.role !== "user") continue;
+			if (this.#seenUserEntryIds.has(entry.id)) continue;
+			this.#seenUserEntryIds.add(entry.id);
+			const serialized = serializeTurn(entry.message, []);
+			if (serialized) this.#pushContext(serialized);
+		}
+	}
 	/** Append a serialized turn to the rolling buffer, evicting oldest by chars. */
 	#pushContext(serialized: string): void {
 		this.#contextBuffer.push(serialized);
@@ -302,13 +315,18 @@ export class AdvisorRuntime {
 		return this.#lifecycle.signal;
 	}
 
-	/** Seed the context buffer so enabling mid-session doesn't replay old turns.
-	 *  With the rolling buffer model the seed is simply "start empty": only new
-	 *  turns go in. Kept as a no-op for the wiring layer's existing call sites. */
-	seedToLeaf(_branch: SessionEntry[]): void {
+	/** Start with an empty context while marking existing user prompts as seen.
+	 *  This prevents enabling/resuming mid-session from replaying old history;
+	 *  prompts submitted after the seed are captured on the next turn_end. */
+	seedToLeaf(branch: SessionEntry[]): void {
 		this.#contextBuffer = [];
 		this.#contextChars = 0;
 		this.#pending = [];
+		this.#seenUserEntryIds = new Set(
+			branch
+				.filter((entry) => entry.type === "message" && entry.message.role === "user")
+				.map((entry) => entry.id),
+		);
 	}
 
 	/** Re-prime after a history rewrite (compaction, session switch/resume,
@@ -320,6 +338,7 @@ export class AdvisorRuntime {
 		this.#consecutiveFailures = 0;
 		this.#contextBuffer = [];
 		this.#contextChars = 0;
+		this.#seenUserEntryIds.clear();
 	}
 
 	/** Tear down: drop everything and abort any in-flight review. */

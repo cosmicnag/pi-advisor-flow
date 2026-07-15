@@ -8,10 +8,14 @@ import {
 	formatAdvisorBatchContent,
 	isInterruptingSeverity,
 	normalizeConfig,
+	parseAdvisorContextSize,
 	parseModelRef,
 	formatModelRef,
 	DEFAULT_CONFIG,
 	escapeXmlText,
+	MAX_CONTEXT_CHARS,
+	MIN_CONTEXT_CHARS,
+	RECOMMENDED_CONTEXT_CHARS,
 } from "../src/index.js";
 
 describe("parseModelRef / formatModelRef", () => {
@@ -80,6 +84,32 @@ describe("normalizeConfig", () => {
 	});
 });
 
+describe("advisor context size", () => {
+	it("defaults to the recommended 24k character window", () => {
+		expect(RECOMMENDED_CONTEXT_CHARS).toBe(24_000);
+		expect(DEFAULT_CONFIG.contextChars).toBe(RECOMMENDED_CONTEXT_CHARS);
+	});
+
+	it("parses raw characters, k suffixes, and the default alias", () => {
+		expect(parseAdvisorContextSize("24000")).toBe(24_000);
+		expect(parseAdvisorContextSize("24k")).toBe(24_000);
+		expect(parseAdvisorContextSize("24 KB")).toBe(24_000);
+		expect(parseAdvisorContextSize("default")).toBe(RECOMMENDED_CONTEXT_CHARS);
+		expect(parseAdvisorContextSize("recommended")).toBe(RECOMMENDED_CONTEXT_CHARS);
+	});
+
+	it("rejects malformed and out-of-range command values", () => {
+		expect(parseAdvisorContextSize("large")).toBeNull();
+		expect(parseAdvisorContextSize(String(MIN_CONTEXT_CHARS - 1))).toBeNull();
+		expect(parseAdvisorContextSize(String(MAX_CONTEXT_CHARS + 1))).toBeNull();
+	});
+
+	it("clamps directly edited config values to safe bounds", () => {
+		expect(normalizeConfig({ contextChars: 1 }).contextChars).toBe(MIN_CONTEXT_CHARS);
+		expect(normalizeConfig({ contextChars: 999_999 }).contextChars).toBe(MAX_CONTEXT_CHARS);
+		expect(normalizeConfig({ contextChars: 50_000.9 }).contextChars).toBe(50_000);
+	});
+});
 describe("syncLag", () => {
 	it("defaults to 0 (off — advisor reviews in the background)", () => {
 		expect(DEFAULT_CONFIG.syncLag).toBe(0);
