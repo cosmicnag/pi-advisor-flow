@@ -8,6 +8,8 @@
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readProjectInstructions } from "./project-instructions.js";
+import { readGlobalInstructions } from "./global-instructions.js";
 import { join } from "node:path";
 
 /** Subdirectory under the pi agent dir where this extension stores its config. */
@@ -27,6 +29,12 @@ export const ADVISOR_COMMAND_DESCRIPTION =
 
 /** Severity of an advisor note. Mirrors oh-my-pi's advisor severity ladder. */
 export type AdvisorSeverity = "nit" | "concern" | "blocker";
+
+/** Which source of advisor instructions is active. Global instructions live
+ *  per-user (`~/.pi/agent/extensions/pi-advisor-instructions.md`); project
+ *  instructions live in each repo's `.pi/advisor.md`. Default `"project"` so a
+ *  fresh repo does NOT inherit the global file unless the user opts in. */
+export type AdvisorInstructionsMode = "project" | "global" | "none";
 
 /** One advice note produced by the advisor. */
 export interface AdvisorNote {
@@ -105,6 +113,50 @@ export function formatAdvisorBatchContent(notes: readonly AdvisorNote[]): string
 		.join("\n");
 }
 
+/** Selectable review trigger points. The advisor captures every finalized
+ *  turn into its rolling buffer regardless of which triggers are enabled
+ *  (capture is decoupled from scheduling); only the enabled triggers actually
+ *  *schedule* a review. `input` is deliberately NOT a review point — it
+ *  precedes any implementation output and is used only to delimit/reset a goal
+ *  (and to cancel the `mid_pause` debounce). Multi-select, persisted globally,
+ *  toggled via `/advisor triggers`. Default: `["turn_end", "tool_error"]`. */
+export type AdvisorTrigger =
+	| "turn_end"
+	| "tool_error"
+	| "tool_result"
+	| "agent_settled"
+	| "mid_pause"
+	| "input";
+
+/** All selectable triggers, in menu/display order. */
+export const ADVISOR_TRIGGERS: readonly AdvisorTrigger[] = [
+	"turn_end",
+	"tool_error",
+	"tool_result",
+	"agent_settled",
+	"mid_pause",
+	"input",
+];
+
+/** Human-readable one-liner for each trigger, shown in the `/advisor triggers`
+ *  toggle menu and `/advisor status`. */
+export const ADVISOR_TRIGGER_LABELS: Record<AdvisorTrigger, string> = {
+	turn_end: "After every turn (turn_end)",
+	tool_error: "After a turn containing a tool error (deferred to turn_end)",
+	tool_result: "After each tool completes (tool_execution_end)",
+	agent_settled: "Once when the agent run fully settles (agent_settled)",
+	mid_pause: "After a quiet period mid-run (debounced; at most once per input)",
+	input: "On user input — prompt/intent review before the agent runs",
+};
+
+/** Default trigger set. */
+export const DEFAULT_TRIGGERS: AdvisorTrigger[] = ["turn_end", "tool_error"];
+
+/** Default quiet period for the `mid_pause` debounce, in ms. */
+export const DEFAULT_MID_PAUSE_MS = 4000;
+export const MIN_MID_PAUSE_MS = 500;
+export const MAX_MID_PAUSE_MS = 60_000;
+
 export interface AdvisorConfig {
 	/** Master switch. When false, no review occurs even if a model is configured. */
 	enabled: boolean;
@@ -149,6 +201,16 @@ export interface AdvisorConfig {
 	syncLag: number;
 	/** Override the advisor system prompt. Defaults to the built-in prompt. */
 	systemPrompt?: string;
+	/** Enabled review triggers (multi-select). Capture always runs on turn_end;
+	 *  only these triggers schedule a review. Default `["turn_end","tool_error"]`. */
+	triggers: AdvisorTrigger[];
+	/** Quiet period (ms) for the `mid_pause` debounce trigger. Ignored unless
+	 *  `mid_pause` is in `triggers`. See `/advisor triggers`. */
+	midPauseMs: number;
+	/** Which instruction source is active. "project" = per-repo `.pi/advisor.md`
+	 *  (default; opt-OUT of global); "global" = the per-user global file
+	 *  (`/advisor instructions global …`); "none" = neither. */
+	instructionsMode: AdvisorInstructionsMode;
 }
 
 /** Recommended rolling transcript budget: about 6k tokens for typical code/chat. */
@@ -184,7 +246,25 @@ export const DEFAULT_CONFIG: AdvisorConfig = {
 	maxRetries: 3,
 	interrupting: true,
 	syncLag: 0,
+	triggers: [...DEFAULT_TRIGGERS],
+	midPauseMs: DEFAULT_MID_PAUSE_MS,
+	instructionsMode: "project",
 };
+
+/** Parse/validate the `triggers` array from raw config. Unknown entries are
+ *  dropped; de-duplicated preserving order; falls back to defaults if empty. */
+function normalizeTriggers(raw: unknown): AdvisorTrigger[] {
+	const known = new Set<string>(ADVISOR_TRIGGERS);
+	let arr: AdvisorTrigger[];
+	if (Array.isArray(raw)) {
+		arr = raw.filter((t): t is AdvisorTrigger => typeof t === "string" && known.has(t));
+	} else {
+		arr = [];
+	}
+	// de-dupe preserving order
+	arr = [...new Set(arr)];
+	return arr.length > 0 ? arr : [...DEFAULT_TRIGGERS];
+}
 
 const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
 function isThinkingLevel(v: unknown): v is AdvisorConfig["thinkingLevel"] {
@@ -264,6 +344,25 @@ export function normalizeConfig(raw: unknown): AdvisorConfig {
 	if (typeof obj.systemPrompt === "string" && obj.systemPrompt.trim()) {
 		base.systemPrompt = obj.systemPrompt;
 	}
+	// `triggers` is read unconditionally: when absent/invalid, normalizeTriggers
+	// falls back to DEFAULT_TRIGGERS, so a config file written by an older
+	// version (before the field existed) still yields a valid selection rather
+	// than an empty set. This is what makes the globally-saved menu choices
+	// survive a reload instead of silently reverting.
+	base.triggers = normalizeTriggers(obj.triggers);
+	if (
+		typeof obj.midPauseMs === "number" &&
+		Number.isFinite(obj.midPauseMs) &&
+		obj.midPauseMs > 0
+	) {
+		base.midPauseMs = Math.min(MAX_MID_PAUSE_MS, Math.max(MIN_MID_PAUSE_MS, Math.floor(obj.midPauseMs)));
+	}
+	// `instructionsMode` selects which instruction source is active. Unknown/
+	// absent values fall back to "project" (opt-out of global), matching the
+	// default so old config files (pre-mode) keep using project instructions.
+	if (obj.instructionsMode === "global" || obj.instructionsMode === "none" || obj.instructionsMode === "project") {
+		base.instructionsMode = obj.instructionsMode;
+	}
 	return base;
 }
 
@@ -288,4 +387,24 @@ export function writeConfig(config: AdvisorConfig): string {
 	}
 	writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf8");
 	return path;
+}
+
+/** Resolve the active advisor instructions text for a given config + cwd,
+ *  honoring {@link AdvisorConfig.instructionsMode}:
+ *  - "project": per-repo `.pi/advisor.md` (default; opt-out of global)
+ *  - "global": the per-user global file
+ *  - "none": no instructions
+ *
+ *  Falls back gracefully: a missing project file yields ""; a missing global
+ *  file yields "" (so "global" with no file set is silent, not an error). */
+export function resolveActiveInstructions(config: AdvisorConfig, cwd: string): string {
+	switch (config.instructionsMode) {
+		case "global":
+			return readGlobalInstructions();
+		case "none":
+			return "";
+		case "project":
+		default:
+			return readProjectInstructions(cwd);
+	}
 }

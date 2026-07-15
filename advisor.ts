@@ -31,6 +31,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	ADVISOR_COMMAND_DESCRIPTION,
+	ADVISOR_TRIGGERS,
+	ADVISOR_TRIGGER_LABELS,
 	formatModelRef,
 	MAX_CONTEXT_CHARS,
 	MIN_CONTEXT_CHARS,
@@ -40,10 +42,18 @@ import {
 	readConfig,
 	writeConfig,
 	type AdvisorConfig,
+	type AdvisorTrigger,
 } from "./src/index.js";
 import { AdvisorRuntime, makeHost, summarizeResult, type AdvisorRuntimeHost } from "./src/runtime.js";
 import { lastTurnFromBranch } from "./src/transcript.js";
 import { getProjectInstructionsPath, readProjectInstructions, writeProjectInstructions } from "./src/project-instructions.js";
+import {
+	getGlobalInstructionsPath,
+	readGlobalInstructions,
+	writeGlobalInstructions,
+	clearGlobalInstructions,
+	hasGlobalInstructions,
+} from "./src/global-instructions.js";
 
 let config: AdvisorConfig = readConfig();
 let runtime: AdvisorRuntime | null = null;
@@ -56,6 +66,26 @@ function projectInstructions(cwd: string, trusted = true): string | undefined {
 	} catch {
 		// A malformed or unreadable project file must never break the main agent.
 		return undefined;
+	}
+}
+
+/** Resolve the ACTIVE advisor instructions for the runtime, honoring the
+ *  configured `instructionsMode`. Trust only gates the project source (a global,
+ *  per-user file is never project-scoped). Returns undefined when the active
+ *  source is unset/unreadable so the runtime falls back to the default prompt. */
+function activeInstructions(cwd: string, trusted = true): string | undefined {
+	switch (config.instructionsMode) {
+		case "none":
+			return undefined;
+		case "global":
+			try {
+				return readGlobalInstructions() || undefined;
+			} catch {
+				return undefined;
+			}
+		case "project":
+		default:
+			return projectInstructions(cwd, trusted);
 	}
 }
 
@@ -94,7 +124,70 @@ export default function (pi: ExtensionAPI) {
 			cwd: ctx.cwd,
 			modelRegistry: ctx.modelRegistry,
 			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
-			projectInstructions: projectInstructions(ctx.cwd, ctx.isProjectTrusted()),
+			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
+		});
+	});
+
+	// Selectable triggers (see /advisor triggers). Each adapter is a thin shim
+	// over the runtime; the runtime itself decides whether to capture/schedule
+	// based on the enabled trigger set + latest-wins coalescing. turn_end above
+	// ALWAYS captures the finalized turn; these only add EXTRA review points.
+	pi.on("tool_execution_end", async (event, ctx) => {
+		if (!config.enabled || !config.advisorModel) return;
+		const rt = ensureRuntime(pi);
+		void rt.onToolExecutionEnd(
+			{ toolCallId: event.toolCallId, toolName: event.toolName, result: event.result, isError: event.isError },
+			{
+				signal: ctx.signal,
+				cwd: ctx.cwd,
+				modelRegistry: ctx.modelRegistry,
+				getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
+				projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
+			},
+		);
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!config.enabled || !config.advisorModel) return;
+		const rt = ensureRuntime(pi);
+		void rt.onAgentSettled({
+			signal: ctx.signal,
+			cwd: ctx.cwd,
+			modelRegistry: ctx.modelRegistry,
+			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
+			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
+		});
+	});
+
+	// input always cancels/re-arms the mid_pause debounce for a new run; it only
+	// triggers a prompt-review when `input` is ticked. (Fires before agent runs.)
+	// The prompt-review runs fire-and-forget so a slow advisor can't block the
+	// agent start; its advice lands as a steer once ready.
+	pi.on("input", async (event, ctx) => {
+		if (!config.enabled || !config.advisorModel) return { action: "continue" as const };
+		const rt = ensureRuntime(pi);
+		void rt.onInput(event.text, {
+			signal: ctx.signal,
+			cwd: ctx.cwd,
+			modelRegistry: ctx.modelRegistry,
+			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
+			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
+		});
+		return { action: "continue" as const };
+	});
+
+	// message_update keeps the mid_pause debounce alive; never schedules directly.
+	// High-frequency (fires per token), so bail early when mid_pause is disabled.
+	pi.on("message_update", async (_event, ctx) => {
+		if (!config.enabled || !config.advisorModel) return;
+		if (!config.triggers.includes("mid_pause")) return;
+		const rt = ensureRuntime(pi);
+		rt.onMessageUpdate({
+			signal: ctx.signal,
+			cwd: ctx.cwd,
+			modelRegistry: ctx.modelRegistry,
+			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
+			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
 		});
 	});
 
@@ -174,13 +267,21 @@ async function handleAdvisorCommand(
 				"                          Set rolling transcript size (default: 24k chars)",
 				"  /advisor thinking <off|minimal|low|medium|high|xhigh>",
 				"                          Set the advisor's thinking effort (off = disabled)",
+				"  /advisor triggers [name] Toggle review triggers (default: turn_end, tool_error)",
+				"                          Options: turn_end, tool_error, tool_result,",
+				"                          agent_settled, mid_pause, input. Capture always runs.",
 				"  /advisor instructions [show|set <text>|edit|clear]",
-				"                          Manage persistent guidance for this project",
+				"                          Manage PROJECT guidance (this repo)",
+				"  /advisor instructions global [show|set <text>|edit|clear]",
+				"                          Manage GLOBAL guidance (cross-repo, per-user)",
+				"  /advisor instructions mode <project|global|none>",
+				"                          Pick active source (default: project; global is opt-in)",
 				"  /advisor review        Re-review the recent transcript now",
 				"  /advisor help          This message",
 				"",
 				"Global config: ~/.pi/agent/extensions/pi-advisor.json",
 				`Project guidance: ${getProjectInstructionsPath(ctx.cwd)}`,
+				`Global guidance: ${getGlobalInstructionsPath()}`,
 				"Advice is delivered as <advisory severity=...> notes: nit (non-interrupting when",
 				"interrupting is off), concern/blocker (always interrupting).",
 			].join("\n"),
@@ -229,6 +330,11 @@ async function handleAdvisorCommand(
 		return;
 	}
 
+	if (sub === "triggers" || sub === "trigger") {
+		await handleTriggers(ctx, rest);
+		return;
+	}
+
 	if (sub === "model") {
 		if (!rest) {
 			ctx.ui.notify("Usage: /advisor model <provider/id>", "warning");
@@ -270,7 +376,7 @@ async function handleAdvisorCommand(
 			cwd: ctx.cwd,
 			modelRegistry: ctx.modelRegistry,
 			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
-			projectInstructions: projectInstructions(ctx.cwd, ctx.isProjectTrusted()),
+			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
 		});
 		ctx.ui.notify(summarizeResult(result), result?.error ? "warning" : "info");
 		return;
@@ -298,14 +404,25 @@ function updateConfig(
 }
 
 async function handleInstructions(ctx: ExtensionCommandContext, rest: string): Promise<void> {
+	const input = rest.trim();
+	const [actionRaw, ...tail] = input.split(/\s+/);
+	const action = actionRaw?.toLowerCase() || (ctx.hasUI ? "edit" : "show");
+
+	// --- global instructions (per-user, cross-repo): NOT gated by project trust ---
+	if (action === "global") {
+		return handleGlobalInstructions(ctx, tail);
+	}
+
+	// --- instructions mode: choose which source is active (global config) ---
+	if (action === "mode") {
+		return handleInstructionsMode(ctx, tail.join(" "));
+	}
+
+	// --- project instructions: gated by project trust ---
 	if (!ctx.isProjectTrusted()) {
 		ctx.ui.notify("Project advisor instructions are disabled until this project is trusted.", "error");
 		return;
 	}
-
-	const input = rest.trim();
-	const [actionRaw, ...tail] = input.split(/\s+/);
-	const action = actionRaw?.toLowerCase() || (ctx.hasUI ? "edit" : "show");
 	const path = getProjectInstructionsPath(ctx.cwd);
 
 	try {
@@ -362,6 +479,147 @@ async function handleInstructions(ctx: ExtensionCommandContext, rest: string): P
 		ctx.ui.notify(`Saved project advisor instructions. (${path})`, "info");
 	} catch (error) {
 		ctx.ui.notify(`Could not update advisor instructions: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}
+}
+function handleGlobalInstructions(ctx: ExtensionCommandContext, tail: string[]): Promise<void> | void {
+	const [sub, ...rest] = tail;
+	const subAction = sub?.toLowerCase() || "show";
+	const path = getGlobalInstructionsPath();
+	try {
+		if (subAction === "show") {
+			const current = readGlobalInstructions();
+			ctx.ui.notify(current ? `Global advisor instructions:\n\n${current}\n\n${path}` : `No global advisor instructions set.\n${path}`, "info");
+			return;
+		}
+		if (subAction === "clear" || subAction === "remove" || subAction === "reset") {
+			const existed = clearGlobalInstructions();
+			runtime?.reset();
+			runtime?.seedToLeaf(ctx.sessionManager.getBranch());
+			ctx.ui.notify(existed ? `Cleared global advisor instructions. (${path})` : `No global advisor instructions to clear. (${path})`, "info");
+			return;
+		}
+		if (subAction === "set" || subAction === "add") {
+			const text = rest.join(" ").trim();
+			if (!text) {
+				ctx.ui.notify("Usage: /advisor instructions global set <text>", "warning");
+				return;
+			}
+			writeGlobalInstructions(text);
+			runtime?.reset();
+			runtime?.seedToLeaf(ctx.sessionManager.getBranch());
+			ctx.ui.notify(`Saved global advisor instructions. (${path})`, "info");
+			return;
+		}
+		if (subAction === "edit") {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("Interactive editing is unavailable. Use /advisor instructions global set <text>.", "error");
+				return;
+			}
+			return (async () => {
+				const current = readGlobalInstructions();
+				const edited = await ctx.ui.editor("Global advisor instructions (submit empty to clear)", current);
+				if (edited === undefined) {
+					ctx.ui.notify("Global advisor instructions unchanged.", "info");
+					return;
+				}
+				const normalized = edited.trim();
+				writeGlobalInstructions(normalized);
+				runtime?.reset();
+				runtime?.seedToLeaf(ctx.sessionManager.getBranch());
+				ctx.ui.notify(normalized ? `Saved global advisor instructions. (${path})` : `Cleared global advisor instructions. (${path})`, "info");
+			})();
+		}
+		ctx.ui.notify(`Unknown action: "${subAction}". Use show, set <text>, edit, or clear.`, "warning");
+	} catch (error) {
+		ctx.ui.notify(`Could not update global advisor instructions: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}
+}
+
+function handleInstructionsMode(ctx: ExtensionCommandContext, arg: string): void {
+	const mode = arg.trim().toLowerCase();
+	if (!mode) {
+		const gpath = getGlobalInstructionsPath();
+		const ppath = getProjectInstructionsPath(ctx.cwd);
+		ctx.ui.notify(
+			[
+				`Instructions mode: ${config.instructionsMode}`,
+				`  project → per-repo file: ${ppath}`,
+				`  global  → per-user file: ${gpath}${hasGlobalInstructions() ? " (set)" : " (not set)"}`,
+				`  none    → no instructions`,
+				"Usage: /advisor instructions mode <project|global|none>",
+			].join("\n"),
+			"info",
+		);
+		return;
+	}
+	if (mode !== "project" && mode !== "global" && mode !== "none") {
+		ctx.ui.notify(`Unknown mode: "${mode}". Use project, global, or none.`, "error");
+		return;
+	}
+	if (mode === "global" && !hasGlobalInstructions()) {
+		ctx.ui.notify(`No global instructions are set. Save some with /advisor instructions global set <text> first, or it will be silent.`, "warning");
+	}
+	updateConfig(ctx, (c) => ({ ...c, instructionsMode: mode }), `Instructions mode set to ${mode}.`);
+}
+
+/** Toggle-menu for review triggers (multi-select). No native multiselect in
+ *  ctx.ui, so loop a single `select` until the user accepts. Persisted to the
+ *  global config. Capture always runs on turn_end; these only gate scheduling. */
+async function handleTriggers(ctx: ExtensionCommandContext, _rest: string): Promise<void> {
+	if (!ctx.hasUI) {
+		const list = ADVISOR_TRIGGERS.map((t) => `[${config.triggers.includes(t) ? "x" : " "}] ${t} — ${ADVISOR_TRIGGER_LABELS[t]}`);
+		ctx.ui.notify(`Triggers (interactive menu needs a TTY):\n${list.join("\n")}\nUse /advisor triggers <name> to toggle a single trigger.`, "info");
+		return;
+	}
+	const toggle = (t: AdvisorTrigger): AdvisorTrigger[] => {
+		const has = config.triggers.includes(t);
+		return has ? config.triggers.filter((x) => x !== t) : [...config.triggers, t];
+	};
+	const render = () =>
+		ADVISOR_TRIGGERS.map((t) => `${config.triggers.includes(t) ? "[x]" : "[ ]"} ${t} — ${ADVISOR_TRIGGER_LABELS[t]}`);
+
+	// Single-trigger shorthand: /advisor triggers <name>
+	const rest = _rest.trim().toLowerCase() as AdvisorTrigger;
+	if (rest) {
+		if (!ADVISOR_TRIGGERS.includes(rest)) {
+			ctx.ui.notify(`Unknown trigger: "${_rest}". Options: ${ADVISOR_TRIGGERS.join(", ")}.`, "error");
+			return;
+		}
+		const next = toggle(rest);
+		if (next.length === 0) {
+			ctx.ui.notify("At least one trigger must stay enabled.", "warning");
+			return;
+		}
+		// Lightweight write: no buffer reset — the runtime reads config.triggers
+		// live via #has(), so the change takes effect on the next event.
+		config.triggers = next;
+		writeConfig(config);
+		ctx.ui.notify(`Trigger "${rest}" ${next.includes(rest) ? "enabled" : "disabled"}. Active: ${next.join(", ")}.`, "info");
+		return;
+	}
+
+	while (true) {
+		const items = [
+			...render(),
+			"",
+			"✓ Done",
+		];
+		const choice = await ctx.ui.select("Toggle review triggers (capture always runs on turn_end):", items);
+		if (choice === undefined || choice === `✓ Done` || choice === "") {
+			ctx.ui.notify(`Triggers: ${config.triggers.join(", ") || "(none)"}.`, "info");
+			return;
+		}
+		const name = choice.split(" ")[1] as AdvisorTrigger;
+		if (!ADVISOR_TRIGGERS.includes(name)) continue;
+		const next = toggle(name);
+		if (next.length === 0) {
+			ctx.ui.notify("At least one trigger must stay enabled.", "warning");
+			continue;
+		}
+		// Apply in-memory immediately so the next render reflects the toggle.
+		config.triggers = next;
+		writeConfig(config);
+		// No reset needed: the runtime reads config.triggers live via #has().
 	}
 }
 function handleThinking(ctx: ExtensionCommandContext, rest: string): void {
@@ -539,9 +797,12 @@ function showStatus(ctx: ExtensionCommandContext): void {
 	lines.push(`Advisor: ${config.enabled ? "enabled" : "disabled"}`);
 	lines.push(`Advisor model: ${config.advisorModel ?? "(none — pick one with /advisor)"}`);
 	lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
+	lines.push(`Triggers: ${config.triggers.join(", ")}`);
 	const projectTrusted = ctx.isProjectTrusted();
 	const instructions = projectInstructions(ctx.cwd, projectTrusted);
+	lines.push(`Instructions mode: ${config.instructionsMode}`);
 	lines.push(`Project instructions: ${projectTrusted ? (instructions ? `active (${instructions.length} chars)` : "none") : "ignored (project not trusted)"} (${getProjectInstructionsPath(ctx.cwd)})`);
+	lines.push(`Global instructions: ${hasGlobalInstructions() ? `set (${readGlobalInstructions().length} chars)` : "not set"} (${getGlobalInstructionsPath()})`);
 	lines.push(`Context window: ~${config.contextChars.toLocaleString()} chars (~${Math.round(config.contextChars / 4).toLocaleString()} tokens) · max ${config.maxToolRounds} tool rounds${config.cooldownMs > 0 ? ` · cooldown ${config.cooldownMs}ms` : ""}`);
 	lines.push(`Delivery: ${config.interrupting ? "ALL advice interrupts" : "nit → non-interrupting, concern/blocker → interrupting"} (steer${config.interrupting ? " + triggerTurn" : " + triggerTurn for concern/blocker"})`);
 

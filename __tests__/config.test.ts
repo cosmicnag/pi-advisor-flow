@@ -12,10 +12,15 @@ import {
 	parseModelRef,
 	formatModelRef,
 	DEFAULT_CONFIG,
+	DEFAULT_TRIGGERS,
+	DEFAULT_MID_PAUSE_MS,
+	MIN_MID_PAUSE_MS,
+	MAX_MID_PAUSE_MS,
 	escapeXmlText,
 	MAX_CONTEXT_CHARS,
 	MIN_CONTEXT_CHARS,
 	RECOMMENDED_CONTEXT_CHARS,
+	type AdvisorTrigger,
 } from "../src/index.js";
 
 describe("parseModelRef / formatModelRef", () => {
@@ -184,4 +189,75 @@ describe("escapeXmlText", () => {
 
 it("ADVISOR_CUSTOM_TYPE is the stable customType string", () => {
 	expect(ADVISOR_CUSTOM_TYPE).toBe("advisor");
+});
+
+describe("triggers", () => {
+	it("defaults to [turn_end, tool_error]", () => {
+		expect(DEFAULT_CONFIG.triggers).toEqual(["turn_end", "tool_error"]);
+		expect(DEFAULT_TRIGGERS).toEqual(["turn_end", "tool_error"]);
+		expect(normalizeConfig(null).triggers).toEqual(["turn_end", "tool_error"]);
+	});
+
+	it("preserves a non-default trigger set through normalizeConfig (round-trip)", () => {
+		// A globally-saved menu selection must survive a reload, not revert to defaults.
+		const custom: AdvisorTrigger[] = ["agent_settled", "mid_pause"];
+		const c = normalizeConfig({ triggers: custom });
+		expect(c.triggers).toEqual(["agent_settled", "mid_pause"]);
+		// And survives a second normalization (simulating read -> write -> read).
+		expect(normalizeConfig({ triggers: c.triggers }).triggers).toEqual(custom);
+	});
+
+	it("drops unknown trigger entries and de-duplicates", () => {
+		const c = normalizeConfig({ triggers: ["turn_end", "bogus", "turn_end", "agent_settled"] });
+		expect(c.triggers).toEqual(["turn_end", "agent_settled"]);
+	});
+
+	it("falls back to defaults when the array is empty or all-invalid", () => {
+		expect(normalizeConfig({ triggers: [] }).triggers).toEqual(["turn_end", "tool_error"]);
+		expect(normalizeConfig({ triggers: ["nope"] }).triggers).toEqual(["turn_end", "tool_error"]);
+	});
+
+	it("does NOT fall back when an old config file omits the field entirely", () => {
+		// An old config (pre-triggers) normalized must still get a valid set.
+		expect(normalizeConfig({ enabled: true }).triggers).toEqual(["turn_end", "tool_error"]);
+	});
+});
+
+describe("midPauseMs", () => {
+	it("defaults to the recommended quiet period", () => {
+		expect(DEFAULT_CONFIG.midPauseMs).toBe(DEFAULT_MID_PAUSE_MS);
+		expect(normalizeConfig(null).midPauseMs).toBe(DEFAULT_MID_PAUSE_MS);
+	});
+
+	it("preserves a valid value", () => {
+		expect(normalizeConfig({ midPauseMs: 7000 }).midPauseMs).toBe(7000);
+	});
+
+	it("clamps out-of-range values to safe bounds", () => {
+		expect(normalizeConfig({ midPauseMs: 1 }).midPauseMs).toBe(MIN_MID_PAUSE_MS);
+		expect(normalizeConfig({ midPauseMs: 999_999 }).midPauseMs).toBe(MAX_MID_PAUSE_MS);
+	});
+
+	it("ignores a non-number (stays at default)", () => {
+		expect(normalizeConfig({ midPauseMs: "slow" as unknown as number }).midPauseMs).toBe(DEFAULT_MID_PAUSE_MS);
+		expect(normalizeConfig({ midPauseMs: NaN }).midPauseMs).toBe(DEFAULT_MID_PAUSE_MS);
+	});
+});
+
+describe("instructionsMode", () => {
+	it("defaults to project (opt-out of global)", () => {
+		expect(DEFAULT_CONFIG.instructionsMode).toBe("project");
+		expect(normalizeConfig(null).instructionsMode).toBe("project");
+	});
+
+	it("preserves an explicit global/none selection through normalizeConfig", () => {
+		expect(normalizeConfig({ instructionsMode: "global" }).instructionsMode).toBe("global");
+		expect(normalizeConfig({ instructionsMode: "none" }).instructionsMode).toBe("none");
+		expect(normalizeConfig({ instructionsMode: "project" }).instructionsMode).toBe("project");
+	});
+
+	it("falls back to project for unknown/absent values", () => {
+		expect(normalizeConfig({ instructionsMode: "bogus" as unknown as "project" }).instructionsMode).toBe("project");
+		expect(normalizeConfig({ enabled: true }).instructionsMode).toBe("project");
+	});
 });

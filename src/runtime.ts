@@ -46,12 +46,41 @@ import {
 	type AdvisorConfig,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
+	type AdvisorTrigger,
 } from "./index.js";
 
 /** Minimal slice of the pi API the runtime drives. */
 export interface AdvisorRuntimeHost {
-	/** Deliver one advisor note batch into the primary session. */
-	sendAdvice(notes: AdvisorNote[], model: string): Promise<void>;
+	/** Deliver one advisor note batch into the primary session.
+	 *  `forceNonTriggering` (set for `agent_settled`-triggered reviews) suppresses
+	 *  `triggerTurn` regardless of severity, so a settled review can never start
+	 *  another agent run and re-trigger `agent_settled` (review→advice→run loop). */
+	sendAdvice(notes: AdvisorNote[], model: string, opts?: { forceNonTriggering?: boolean }): Promise<void>;
+}
+
+/** Context the runtime needs to resolve the advisor model/auth and run a
+ *  review. Extracted from the per-event pi payloads so every trigger
+ *  (`turn_end`, `tool_execution_end`, `agent_settled`, `input`, the
+ *  `mid_pause` debounce) can feed the same {@link AdvisorRuntime.requestReview}
+ *  path. */
+export interface ReviewCtx {
+	signal?: AbortSignal;
+	cwd: string;
+	modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
+	getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
+	projectInstructions?: string;
+}
+
+/** Options for {@link AdvisorRuntime.requestReview}. */
+interface RequestOpts {
+	/** Which trigger scheduled this review (for future telemetry/debug). */
+	source?: AdvisorTrigger;
+	/** Extra text appended to the snapshot (e.g. the just-completed tool for
+	 *  `tool_result`, or the new prompt for `input`). */
+	extra?: string;
+	/** When true, delivery never sets `triggerTurn` — used by `agent_settled`
+	 *  to break the review→advice→run→settled loop. */
+	forceNonTriggering?: boolean;
 }
 
 /** One queued turn to review. Captures the per-turn context (B3) and the
@@ -72,6 +101,12 @@ interface PendingTurn {
 	projectInstructions?: string;
 	/** Lifecycle signal: aborted on dispose/reset/compact/tree-nav/session_shutdown. */
 	signal: AbortSignal;
+	/** Latest-wins generation captured at requestReview start. A batch whose gen
+	 *  is no longer current by the time its review returns is suppressed (a newer
+	 *  snapshot superseded it) and never delivered. */
+	gen: number;
+	/** Set for `agent_settled` reviews so delivery omits `triggerTurn`. */
+	forceNonTriggering?: boolean;
 }
 
 export class AdvisorRuntime {
@@ -103,6 +138,30 @@ export class AdvisorRuntime {
 
 	/** Last time a review was *started*, for the cooldown throttle (D3). */
 	#lastReviewAt = 0;
+
+	/** Latest-wins generation counter. Captured synchronously at the start of
+	 *  every {@link requestReview} call (before any `await`) and re-checked after
+	 *  each await so an older call that resolves auth slower than a newer one can
+	 *  never overwrite a fresher snapshot. A batch stores the gen it was enqueued
+	 *  with; delivery is suppressed when the batch's gen no longer equals
+	 *  `#generation`. */
+	#generation = 0;
+
+	/** Set by `tool_execution_end` when `event.isError` is true, so the next
+	 *  `turn_end` reviews the error *with* the finalized turn payload (rather than
+	 *  a half-turn). Consumed by the coalesced shouldReview condition. */
+	#pendingToolError = false;
+
+	/** `mid_pause` trailing-debounce timer. Reset on every message/tool event so
+	 *  only a genuine quiet period fires; cancelled on input/dispose/reset/
+	 *  settled. Guarded by `#midPauseFiredThisRun` so it fires at most once per
+	 *  user input (re-armed by `input`). */
+	#midPauseTimer: ReturnType<typeof setTimeout> | null = null;
+	#midPauseFiredThisRun = false;
+	/** Per-review-run arming flag: cleared on `input`, set when `mid_pause`
+	 *  first becomes armed. Lets us avoid arming the timer when `mid_pause` is
+	 *  disabled without consulting the config on every token. */
+	#midPauseArmed = false;
 
 	/** Injectable review function — defaults to {@link runAdvisorReview}. Exposed
 	 *  so the runtime's queue/epoch/retry discipline can be unit-tested with a
@@ -184,34 +243,126 @@ export class AdvisorRuntime {
 		}
 	}
 
-	/** Called on each primary turn_end. Serializes the turn's payload, queues it,
-	 *  and kicks the drain. */
+	/** Returns true if `t` is in the configured trigger set. */
+	#has(t: AdvisorTrigger): boolean {
+		return this.config.triggers.includes(t);
+	}
+
+	/** Called on each primary turn_end. ALWAYS captures the finalized turn into
+	 *  the rolling buffer (capture is decoupled from scheduling — switching
+	 *  triggers off `turn_end` never loses context), then schedules a review iff
+	 *  the coalesced condition holds:
+	 *  `turn_end` is enabled, OR a tool error is pending AND `tool_error` is
+	 *  enabled. The two default-enabled causes collapse to ONE `requestReview()`
+	 *  so an errored turn isn't reviewed twice (the first model call would still
+	 *  run even if its delivery were generation-suppressed). */
 	onTurnEnd(
 		message: AgentMessage,
 		toolResults: ToolResultMessage[],
 		branch: SessionEntry[],
-		ctx: {
-			signal?: AbortSignal;
-			cwd: string;
-			modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
-			getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
-			projectInstructions?: string;
-		},
+		ctx: ReviewCtx,
 	): Promise<void> {
 		if (this.disposed) return Promise.resolve();
 		if (!this.config.enabled || !this.config.advisorModel) return Promise.resolve();
 
+		// --- capture (always, independent of triggers) ---
 		const serialized = serializeTurn(message, toolResults);
-		// Copy newly-arrived user prompts from the authoritative session branch
-		// before this assistant turn. turn_end itself only carries the assistant
-		// message + tool results, so without this the advisor must infer intent.
 		this.#captureNewUserMessages(branch);
-		if (serialized) {
-			this.#pushContext(serialized);
-		}
+		if (serialized) this.#pushContext(serialized);
+		// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
+		this.#armMidPause(ctx);
 
 		if (!serialized) return Promise.resolve();
-		return this.#queueReview(serialized, ctx);
+
+		// --- schedule (coalesced, trigger-gated) ---
+		const pendingError = this.#pendingToolError;
+		this.#pendingToolError = false;
+		const shouldReview = this.#has("turn_end") || (pendingError && this.#has("tool_error"));
+		if (!shouldReview) return Promise.resolve();
+		return this.requestReview({ source: pendingError && !this.#has("turn_end") ? "tool_error" : "turn_end", ctx });
+	}
+
+	/** `tool_execution_end` adapter. For any tool completion: arms/resets the
+	 *  `mid_pause` debounce. When `event.isError`: sets `#pendingToolError` so
+	 *  the *next* `turn_end` reviews the error alongside the finalized turn
+	 *  (reviewing a half-turn would lose the assistant's recovery intent). When
+	 *  `tool_result` is enabled: schedules an immediate review with the
+	 *  just-finished tool injected as extra context. */
+	onToolExecutionEnd(
+		event: { toolCallId: string; toolName: string; result: unknown; isError?: boolean },
+		ctx: ReviewCtx,
+	): Promise<void> {
+		if (this.disposed || !this.config.enabled || !this.config.advisorModel) return Promise.resolve();
+		// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
+		this.#armMidPause(ctx);
+		if (event.isError) this.#pendingToolError = true;
+		if (this.#has("tool_result")) {
+			const extra = `[tool ${event.isError ? "error" : "result"}: ${event.toolName}]\n${
+				typeof event.result === "string" ? event.result : JSON.stringify(event.result)
+			}`;
+			return this.requestReview({ source: "tool_result", ctx, extra });
+		}
+		return Promise.resolve();
+	}
+
+	/** `agent_settled` adapter: fires once per agent run, after the whole
+	 *  tool/turn loop with no automatic continuation. Delivers non-triggering
+	 *  (`forceNonTriggering`) so the review can never start another run and
+	 *  re-fire `agent_settled` (review→advice→run→settled loop). The `mid_pause`
+	 *  timer is cancelled since the run is over. */
+	onAgentSettled(ctx: ReviewCtx): Promise<void> {
+		if (this.disposed || !this.config.enabled || !this.config.advisorModel) return Promise.resolve();
+		this.#cancelMidPause();
+		if (!this.#has("agent_settled")) return Promise.resolve();
+		return this.requestReview({ source: "agent_settled", ctx, forceNonTriggering: true });
+	}
+
+	/** `input` adapter. ALWAYS delimits a goal (arms/cancels `mid_pause`) so the
+	 *  debounce is scoped per-user-input regardless of whether `input` itself is
+	 *  a review trigger. When `input` IS enabled: runs a prompt-review (judges
+	 *  intent before the agent acts) with the prompt as extra context. */
+	onInput(text: string, ctx: ReviewCtx): Promise<void> {
+		if (this.disposed || !this.config.enabled || !this.config.advisorModel) return Promise.resolve();
+		// Re-arm mid_pause for a new run: a fresh prompt means any prior quiet
+		// period was the inter-message gap, not a decision pause.
+		this.#midPauseFiredThisRun = false;
+		this.#armMidPause(ctx);
+		if (!this.#has("input")) return Promise.resolve();
+		return this.requestReview({ source: "input", ctx, extra: `[user prompt]\n${text}` });
+	}
+
+	/** `message_update` adapter: keeps the `mid_pause` debounce alive while the
+	 *  agent streams, so only a genuine quiet period (no tokens AND no tool
+	 *  activity) triggers a review. Never schedules directly off a token —
+	 *  reviewing an incomplete snapshot races the active stream. */
+	onMessageUpdate(ctx: ReviewCtx): void {
+		if (this.disposed || !this.config.enabled || !this.config.advisorModel) return;
+		this.#armMidPause(ctx);
+	}
+
+	/** Arm (or re-arm) the trailing debounce: reset the inactivity timer to
+	 *  `midPauseMs`. Cancelled by reset/dispose/settled/input-armed-fresh; fires
+	 *  at most once per user input (`#midPauseFiredThisRun`). */
+	#armMidPause(ctx: ReviewCtx): void {
+		if (!this.#has("mid_pause")) return;
+		if (this.#midPauseFiredThisRun) return;
+		this.#cancelMidPause();
+		this.#midPauseArmed = true;
+		this.#midPauseTimer = setTimeout(() => {
+			this.#midPauseTimer = null;
+			if (this.#midPauseFiredThisRun || this.disposed) return;
+			this.#midPauseFiredThisRun = true;
+			this.#midPauseArmed = false;
+			// Fire-and-forget; the runtime's own single-flight + generation guards apply.
+			void this.requestReview({ source: "mid_pause", ctx });
+		}, this.config.midPauseMs);
+	}
+
+	#cancelMidPause(): void {
+		if (this.#midPauseTimer) {
+			clearTimeout(this.#midPauseTimer);
+			this.#midPauseTimer = null;
+		}
 	}
 
 	/** Build the full session-update text from the rolling context buffer and a
@@ -245,18 +396,23 @@ export class AdvisorRuntime {
 		}
 	}
 
-	/** Resolve auth + model at queue time (B3) and enqueue a turn for review. */
-	async #queueReview(
-		serializedTurn: string,
-		ctx: {
-			signal?: AbortSignal;
-			cwd: string;
-			modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
-			getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
-			projectInstructions?: string;
-		},
-	): Promise<void> {
-		const ref = this.config.advisorModel!;
+	/** Resolve auth + model and enqueue a review. Latest-wins discipline:
+	 *  the generation counter is captured SYNCHRONOUSLY at the very start (before
+	 *  any await) so overlapping events can't reorder; after each await we drop
+	 *  this request if a newer one has superseded it. The pending queue holds at
+	 *  most ONE entry (newer replaces older), so only the latest snapshot can
+	 *  ever be reviewed/delivered. */
+	async requestReview(opts: { source?: AdvisorTrigger; ctx: ReviewCtx; extra?: string; forceNonTriggering?: boolean }): Promise<void> {
+		if (this.disposed || !this.config.advisorModel) return;
+		// Snapshot the generation SYNCHRONOUSLY (before any await) so overlapping
+		// events resolving auth out of order can't let an older snapshot win. We do
+		// NOT bump it here: bumping before the cooldown early-return would
+		// invalidate the in-flight review's delivery (gen mismatch) without
+		// enqueuing a replacement, silently dropping BOTH. The generation is only
+		// bumped once we commit to actually running (after cooldown passes).
+		const startGen = this.#generation;
+		const ctx = opts.ctx;
+		const ref = this.config.advisorModel;
 		const parsed = this.#parseRef(ref);
 		if (!parsed) {
 			this.#lastResult = { advise: null, rounds: 0, error: `Invalid advisor model ref: ${ref}` };
@@ -268,6 +424,9 @@ export class AdvisorRuntime {
 			return;
 		}
 		const auth = await ctx.getApiKeyAndHeaders(model);
+		// A newer review already committed (bumped the generation) during this
+		// await — drop this older one so it can't overwrite the fresher snapshot.
+		if (this.#generation !== startGen) return;
 		if (!auth.ok || !auth.apiKey) {
 			this.#lastResult = {
 				advise: null,
@@ -277,23 +436,34 @@ export class AdvisorRuntime {
 			return;
 		}
 
-		// Cooldown (D3): if a review started too recently, coalesce this turn
-		// into the buffer and skip queueing — it'll be covered by the next review.
+		// Cooldown (D3): if a review started too recently, coalesce into the buffer
+		// (the next review will cover it) and skip queueing. We return WITHOUT
+		// bumping the generation, so the in-flight review remains the latest and
+		// its delivery is not suppressed.
 		const now = Date.now();
 		if (this.config.cooldownMs > 0 && now - this.#lastReviewAt < this.config.cooldownMs) {
 			return;
 		}
 
+		// Commit: become the newest generation. Any still-in-flight review with an
+		// older gen will have its delivery suppressed.
+		const myGen = ++this.#generation;
+		const text = opts.extra ? `${this.#buildUpdate(true)}\n\n${opts.extra}` : this.#buildUpdate(true);
 		const turn: PendingTurn = {
-			text: this.#buildUpdate(true),
+			text,
 			modelRef: ref,
 			auth: { apiKey: auth.apiKey, headers: auth.headers },
 			model,
 			cwd: ctx.cwd,
 			projectInstructions: ctx.projectInstructions,
 			signal: this.#adoptSignal(ctx.signal),
+			gen: myGen,
+			forceNonTriggering: opts.forceNonTriggering,
 		};
-		this.#pending.push(turn);
+		// Latest-wins: keep at most one pending; a newer request replaces an older
+		// one that hasn't drained yet.
+		if (this.#pending.length > 0) this.#pending[0] = turn;
+		else this.#pending.push(turn);
 		await this.#drain();
 	}
 
@@ -322,6 +492,9 @@ export class AdvisorRuntime {
 		this.#contextBuffer = [];
 		this.#contextChars = 0;
 		this.#pending = [];
+		this.#pendingToolError = false;
+		this.#cancelMidPause();
+		this.#midPauseFiredThisRun = false;
 		this.#seenUserEntryIds = new Set(
 			branch
 				.filter((entry) => entry.type === "message" && entry.message.role === "user")
@@ -339,6 +512,10 @@ export class AdvisorRuntime {
 		this.#contextBuffer = [];
 		this.#contextChars = 0;
 		this.#seenUserEntryIds.clear();
+		this.#pendingToolError = false;
+		this.#cancelMidPause();
+		this.#midPauseFiredThisRun = false;
+		this.#midPauseArmed = false;
 	}
 
 	/** Tear down: drop everything and abort any in-flight review. */
@@ -347,6 +524,9 @@ export class AdvisorRuntime {
 		this.#bumpEpoch();
 		this.#pending = [];
 		this.#consecutiveFailures = 0;
+		this.#cancelMidPause();
+		this.#midPauseFiredThisRun = false;
+		this.#midPauseArmed = false;
 	}
 
 	/** Bump the epoch and abort the lifecycle controller (replacing it). */
@@ -360,19 +540,13 @@ export class AdvisorRuntime {
 	async reviewNow(
 		message: AgentMessage,
 		toolResults: ToolResultMessage[],
-		ctx: {
-			signal?: AbortSignal;
-			cwd: string;
-			modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
-			getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
-			projectInstructions?: string;
-		},
+		ctx: ReviewCtx,
 	): Promise<AdvisorReviewResult | null> {
 		if (this.#busy) return null;
 		const serialized = serializeTurn(message, toolResults);
 		if (!serialized || !this.config.advisorModel) return null;
 		this.#pushContext(serialized);
-		await this.#queueReview(serialized, ctx);
+		await this.requestReview({ source: "turn_end", ctx });
 		return this.#lastResult;
 	}
 
@@ -412,6 +586,9 @@ export class AdvisorRuntime {
 				this.#consecutiveFailures = 0;
 				this.#lastResult = result;
 				if (result.advise) {
+					// Latest-wins delivery suppression: if a newer request superseded
+					// this batch while it was in flight, drop the stale result.
+					if (batch.gen !== this.#generation) continue;
 					const note: AdvisorNote = { note: result.advise.note, severity: result.advise.severity };
 					const key = adviceKey(note.note);
 					// B5: hard dedupe at delivery. Skip repeats outright.
@@ -425,6 +602,7 @@ export class AdvisorRuntime {
 						await this.host.sendAdvice(
 							[note],
 							this.#lastAdvisorModel ?? this.config.advisorModel ?? "",
+							{ forceNonTriggering: batch.forceNonTriggering },
 						);
 					}
 				}
@@ -521,10 +699,15 @@ export function makeHost(
 	getInterrupting: () => boolean = () => false,
 ): Pick<AdvisorRuntimeHost, "sendAdvice"> {
 	return {
-		sendAdvice: async (notes, model) => {
+		sendAdvice: async (notes, model, opts) => {
 			const content = formatAdvisorBatchContent(notes);
 			const details: AdvisorMessageDetails = { notes, model };
-			const opts = deliveryOptions(notes[0]?.severity, getInterrupting());
+			// `forceNonTriggering` (agent_settled reviews) suppresses triggerTurn
+			// regardless of severity, breaking the review→advice→run→settled loop.
+			const base = deliveryOptions(notes[0]?.severity, getInterrupting());
+			const deliverOpts = opts?.forceNonTriggering
+				? { deliverAs: base.deliverAs as "steer" }
+				: base;
 			await pi.sendMessage(
 				{
 					customType: ADVISOR_CUSTOM_TYPE,
@@ -532,7 +715,7 @@ export function makeHost(
 					display: true,
 					details,
 				},
-				opts,
+				deliverOpts,
 			);
 		},
 	};

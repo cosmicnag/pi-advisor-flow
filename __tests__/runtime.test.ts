@@ -14,7 +14,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { ADVISOR_CUSTOM_TYPE } from "../src/index.js";
 import type { AdvisorReviewResult } from "../src/agent.js";
-import type { AdvisorNote } from "../src/index.js";
+import type { AdvisorNote, AdvisorTrigger } from "../src/index.js";
 
 let idCounter = 0;
 function entry(role: "user" | "assistant", text: string): SessionEntry {
@@ -97,9 +97,9 @@ const FAKE_MODEL: Model<Api> = {
 function makeRuntime(
 	review: ReviewFn,
 	branch: SessionEntry[] = [],
-	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number; syncLag: number }> = {},
+	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number; syncLag: number; triggers: AdvisorTrigger[]; midPauseMs: number }> = {},
 ) {
-	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string) => {});
+	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string, _opts?: { forceNonTriggering?: boolean }) => {});
 	const host = { sendAdvice };
 	const rt = new AdvisorRuntime(
 		host as never,
@@ -114,6 +114,9 @@ function makeRuntime(
 			maxRetries: config.maxRetries ?? 3,
 			interrupting: true,
 			syncLag: config.syncLag ?? 0,
+			triggers: config.triggers ?? ["turn_end", "tool_error"],
+			midPauseMs: config.midPauseMs ?? 4000,
+			instructionsMode: "project",
 		},
 		review as never,
 	);
@@ -379,15 +382,16 @@ describe("AdvisorRuntime — lag (sync backlog metric)", () => {
 		expect(rt.lag).toBe(1);
 	});
 
-	it("lag counts queued backlog + an in-flight review", async () => {
+	it("lag counts an in-flight review (latest-wins collapses the backlog)", async () => {
 		const { rt, ctx } = makeRuntime(() => new Promise<AdvisorReviewResult>(() => {}));
 		for (let i = 0; i < 4; i++) {
 			const ti = turn(`turn-${i}`);
 			void rt.onTurnEnd(ti.message as AgentMessage, ti.toolResults, [entry("user", `turn-${i}`)], ctx);
 		}
 		await new Promise((r) => setTimeout(r, 15));
-		// One review in flight, three queued behind it.
-		expect(rt.lag).toBe(4);
+		// Latest-wins: the 4 turns collapse to 1 pending (the newest), so lag is
+		// 1 in flight + 0 queued = 1, not 4.
+		expect(rt.lag).toBe(1);
 	});
 });
 
@@ -453,7 +457,8 @@ describe("AdvisorRuntime — waitForCatchUp (sync gate)", () => {
 			void rt.onTurnEnd(ti.message as AgentMessage, ti.toolResults, [entry("user", `turn-${i}`)], ctx);
 		}
 		await new Promise((r) => setTimeout(r, 15));
-		expect(rt.lag).toBe(4); // 1 in flight + 3 queued
+		// Latest-wins: backlog collapses to the newest, so lag = 1 in flight.
+		expect(rt.lag).toBe(1);
 
 		let resolved = false;
 		const p = rt.waitForCatchUp(1).then(() => { resolved = true; });
@@ -468,5 +473,193 @@ describe("AdvisorRuntime — waitForCatchUp (sync gate)", () => {
 		await p;
 		expect(resolved).toBe(true);
 		expect(rt.lag).toBe(0);
+	});
+});
+
+describe("AdvisorRuntime — selectable triggers", () => {
+	/** Flush one macrotask (+ pending microtasks). Real-timer counterpart to
+	 *  `vi.advanceTimersByTimeAsync(0)` under fake timers. */
+	const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+	/** A review fn that records each snapshot text and stays in flight until the
+	 *  test calls `release`. Used to model an in-flight review while newer
+	 *  events arrive (latest-wins). */
+	function hangingReview(): { review: ReviewFn; calls: string[]; release: (r: AdvisorReviewResult) => void } {
+		const calls: string[] = [];
+		let release: (r: AdvisorReviewResult) => void = () => {};
+		const review: ReviewFn = (text) => {
+			calls.push(text);
+			return new Promise<AdvisorReviewResult>((res) => { release = res; });
+		};
+		return { review, calls, release: (r) => release(r) };
+	}
+
+	it("default triggers review on turn_end", async () => {
+		const { rt, ctx, sendAdvice } = makeRuntime(async () => ({ advise: null, rounds: 0 }));
+		const t = turn("hello");
+		await rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await settle(rt);
+		expect(sendAdvice).not.toHaveBeenCalled(); // silent review, nothing to deliver
+		expect(rt.lastResult).not.toBeNull(); // a review ran
+	});
+
+	it("does NOT review on turn_end when turn_end is unticked (capture still runs)", async () => {
+		const { rt, ctx } = makeRuntime(async () => ({ advise: null, rounds: 0 }), [], { triggers: ["agent_settled"] });
+		const t = turn("hello");
+		await rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await settle(rt);
+		expect(rt.lastResult).toBeNull(); // no review scheduled
+		// But the buffer captured the turn: a later agent_settled sees it.
+		await rt.onAgentSettled(ctx);
+		await settle(rt);
+		expect(rt.lastResult).not.toBeNull(); // a settled review ran against the captured buffer
+	});
+
+	it("tool_error defers to turn_end and reviews with the finalized buffer (single call)", async () => {
+		let count = 0;
+		const { rt, ctx } = makeRuntime(async () => { count++; return { advise: null, rounds: 1 }; });
+		// tool errors during the run, before turn_end.
+		await rt.onToolExecutionEnd({ toolCallId: "c1", toolName: "bash", result: "boom", isError: true }, ctx);
+		await rt.onToolExecutionEnd({ toolCallId: "c2", toolName: "edit", result: "ok" }, ctx);
+		expect(count).toBe(0); // nothing reviewed yet — tool_error is deferred
+		// turn_end fires: one coalesced review (NOT two — turn_end + tool_error).
+		const t = turn("recovered");
+		await rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "x")], ctx);
+		await settle(rt);
+		expect(count).toBe(1);
+	});
+
+	it("tool_result trigger reviews immediately with the tool injected as extra", async () => {
+		let captured = "";
+		const { rt, ctx } = makeRuntime(async (text) => { captured = text; return { advise: null, rounds: 0 }; }, [], { triggers: ["tool_result"] });
+		await rt.onToolExecutionEnd({ toolCallId: "c1", toolName: "bash", result: "done" }, ctx);
+		await settle(rt);
+		expect(captured).toContain("[tool result: bash]");
+		expect(captured).toContain("done");
+	});
+
+	it("agent_settled fires once across many turns and never delivers triggering", async () => {
+		const calls: string[] = [];
+		const { rt, ctx, sendAdvice } = makeRuntime(
+			async (text) => { calls.push(text); return { advise: { note: "final nit", severity: "nit" as const }, rounds: 1 }; },
+			[],
+			{ triggers: ["agent_settled"] },
+		);
+		// Many turns happen (agent_settled is NOT enabled, so they don't review)...
+		for (let i = 0; i < 3; i++) {
+			const t = turn(`turn-${i}`);
+			await rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", `u${i}`)], ctx);
+		}
+		await settle(rt);
+		expect(calls.length).toBe(0); // no per-turn reviews
+		// ...then the run settles: exactly one review.
+		await rt.onAgentSettled(ctx);
+		await settle(rt);
+		expect(calls.length).toBe(1);
+		expect(sendAdvice).toHaveBeenCalledTimes(1);
+		// Loop-break: settled delivery MUST pass forceNonTriggering:true.
+		expect(sendAdvice.mock.calls[0][2]).toEqual({ forceNonTriggering: true });
+	});
+
+	it("agent_settled loop regression: a settled review never re-triggers a recursive chain", async () => {
+		const calls: string[] = [];
+		const { rt, ctx } = makeRuntime(async (text) => {
+			calls.push(text);
+			return { advise: { note: "x", severity: "nit" as const }, rounds: 1 };
+		}, [], { triggers: ["agent_settled"] });
+		await rt.onAgentSettled(ctx);
+		await settle(rt);
+		expect(calls.length).toBe(1);
+		// A genuine second settlement (e.g. the host re-runs) DOES review once.
+		await rt.onAgentSettled(ctx);
+		await settle(rt);
+		expect(calls.length).toBe(2);
+		// No further spontaneous reviews — the loop is bounded.
+		await settle(rt);
+		expect(calls.length).toBe(2);
+	});
+
+	it("latest-wins: an in-flight stale review is suppressed; only the newest is delivered", async () => {
+		const { review, calls, release } = hangingReview();
+		const { rt, ctx, sendAdvice } = makeRuntime(review);
+		// First turn goes in flight (review hangs). Void + flush so it enters drain.
+		const t0 = turn("turn-0");
+		void rt.onTurnEnd(t0.message as AgentMessage, t0.toolResults, [entry("user", "u0")], ctx);
+		await flush();
+		expect(rt.isBusy).toBe(true);
+		expect(calls.length).toBe(1); // the in-flight (stale) snapshot
+		// While in flight, several more turns arrive — each supersedes (replaces pending).
+		for (let i = 1; i <= 3; i++) {
+			const ti = turn(`turn-${i}`);
+			void rt.onTurnEnd(ti.message as AgentMessage, ti.toolResults, [entry("user", `u${i}`)], ctx);
+		}
+		await flush();
+		// Latest-wins keeps at most one pending; the in-flight counts as +1 busy.
+		expect(rt.lag).toBe(2);
+		// Release the in-flight (stale) review: its delivery is generation-suppressed.
+		release({ advise: { note: "stale", severity: "nit" as const }, rounds: 1 });
+		await flush();
+		// The newest snapshot is now in flight (review hangs again).
+		expect(calls.length).toBe(2);
+		expect(sendAdvice).not.toHaveBeenCalled(); // stale was suppressed
+		// Release the newest — it delivers.
+		release({ advise: { note: "fresh", severity: "nit" as const }, rounds: 1 });
+		await settle(rt);
+		expect(sendAdvice).toHaveBeenCalledTimes(1);
+		expect(sendAdvice.mock.calls[0][0][0].note).toBe("fresh");
+	});
+
+	it("mid_pause: trailing debounce fires once after a quiet period, not on every token", async () => {
+		vi.useFakeTimers();
+		try {
+			const { rt, ctx, sendAdvice } = makeRuntime(
+				async () => ({ advise: { note: "paused", severity: "nit" as const }, rounds: 1 }),
+				[],
+				{ triggers: ["mid_pause"], midPauseMs: 1000 },
+			);
+			// Streaming: many message_update events reset the debounce; no review yet.
+			for (let i = 0; i < 5; i++) rt.onMessageUpdate(ctx);
+			await vi.advanceTimersByTimeAsync(500);
+			expect(sendAdvice).not.toHaveBeenCalled();
+			// Quiet period elapses: exactly one review fires.
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(sendAdvice).toHaveBeenCalledTimes(1);
+			// More streaming after the fire does NOT re-fire (at most once per input).
+			for (let i = 0; i < 3; i++) rt.onMessageUpdate(ctx);
+			await vi.advanceTimersByTimeAsync(2000);
+			expect(sendAdvice).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("input re-arms mid_pause (a new prompt cancels the prior quiet-period budget)", async () => {
+		vi.useFakeTimers();
+		try {
+			const { rt, ctx, sendAdvice } = makeRuntime(
+				async () => ({ advise: { note: "p", severity: "nit" as const }, rounds: 1 }),
+				[],
+				{ triggers: ["mid_pause"], midPauseMs: 1000 },
+			);
+			rt.onMessageUpdate(ctx);
+			await vi.advanceTimersByTimeAsync(800); // near the budget
+			// New input cancels the budget and re-arms.
+			void rt.onInput("new goal", ctx);
+			await vi.advanceTimersByTimeAsync(800); // would have fired before the input
+			expect(sendAdvice).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(200); // full budget after input
+			expect(sendAdvice).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("input as a review trigger runs a prompt-review before the agent acts", async () => {
+		let captured = "";
+		const { rt, ctx } = makeRuntime(async (text) => { captured = text; return { advise: null, rounds: 0 }; }, [], { triggers: ["input"] });
+		await rt.onInput("refactor everything", ctx);
+		await settle(rt);
+		expect(captured).toContain("[user prompt]");
+		expect(captured).toContain("refactor everything");
 	});
 });

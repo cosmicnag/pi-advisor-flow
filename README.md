@@ -151,6 +151,57 @@ Manage them from pi:
 
 Project instructions refine what the advisor prioritizes. They cannot grant write/command capabilities or override higher-priority safety constraints.
 
+## Global advisor instructions (cross-repo)
+
+A second, per-user instructions file persists across every repo:
+
+```text
+~/.pi/agent/extensions/pi-advisor-instructions.md
+```
+
+Manage it from any pi session:
+
+```text
+/advisor instructions global set Always prefer tests, avoid scope creep.
+/advisor instructions global show
+/advisor instructions global edit
+/advisor instructions global clear
+```
+
+Then choose which source is active (saved to the global config):
+
+```text
+/advisor instructions mode <project|global|none>
+```
+
+`project` is the default and **opt-out of global**: a fresh repo does *not* inherit the global file unless you switch to `global`. `none` uses neither. This lets you maintain one global guidance set and opt into it per repo without editing each project file.
+
+## Selectable review triggers
+
+By default the advisor reviews at the end of each turn and after a turn that
+contained a tool error (`turn_end` + `tool_error`). You can enable additional
+review points or turn others off — capture of each finalized turn always runs
+on `turn_end` regardless, so switching triggers never loses context.
+
+```text
+/advisor triggers              # open the toggle menu
+/advisor triggers agent_settled  # toggle one trigger by name
+```
+
+| Trigger | Fires |
+|---|---|
+| `turn_end` | After every turn (default) |
+| `tool_error` | After a turn that contained a tool error, deferred to `turn_end` (default) |
+| `tool_result` | After each tool completes |
+| `agent_settled` | Once when the whole run settles (no auto-continuation) — delivered non-interrupting |
+| `mid_pause` | After a quiet period mid-run (debounced; at most once per input) |
+| `input` | On user input — a prompt/intent review before the agent acts |
+
+`agent_settled` is the robust choice for "review once when done, not every
+turn": it fires a single non-triggering review per run, so advice can't blast
+one-by-one after completion. `mid_pause` is opt-in early-warning on genuine
+mid-run inactivity; a fluid run that never pauses fires nothing from it.
+
 ## Commands
 
 | Command | Description |
@@ -163,7 +214,10 @@ Project instructions refine what the advisor prioritizes. They cannot grant writ
 | `/advisor interrupting [on\|off]` | Control whether all advice immediately triggers a main-agent turn |
 | `/advisor sync <0-6>` | Pause the main loop when the advisor falls this many turns behind; `0` disables waiting |
 | `/advisor context [chars\|Nk\|default]` | Inspect or set the rolling transcript budget |
+| `/advisor triggers [name]` | Toggle review triggers (default: `turn_end`, `tool_error`) |
 | `/advisor instructions [show\|set <text>\|edit\|clear]` | Manage project-scoped advisor guidance |
+| `/advisor instructions global [show\|set <text>\|edit\|clear]` | Manage global (cross-repo) advisor guidance |
+| `/advisor instructions mode <project\|global\|none>` | Pick which instruction source is active (default: `project`) |
 | `/advisor review` | Re-review the latest completed turn now |
 | `/advisor help` | Show command help |
 
