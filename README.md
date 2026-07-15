@@ -352,10 +352,13 @@ All control is via the single `/advisor` slash command in the TUI. Tab-completio
 | `/advisor thinking <off\|minimal\|low\|medium\|high\|xhigh>` | Set the advisor's thinking effort (`off` disables thinking). |
 | `/advisor interrupting [on\|off]` | Toggle whether **ALL** advice — including `nit` — triggers a new agent turn immediately. **Default: on** (the agent acknowledges/acts on every note). Run with no arg to flip, or `on`/`off` to set explicitly. When off, `nit` lands as a non-interrupting note for the next turn while `concern`/`blocker` still interrupt. |
 | `/advisor sync [0-6]` | **Wait for the advisor to catch up** at the start of a turn when it has fallen `N` turns behind. **Default: 0** (never wait — the advisor reviews fully in the background, today's behavior). `1` = wait after every turn (fully synchronous). `2`-`6` = allow a bounded backlog so the agent keeps moving while the advisor catches up, only pausing once it falls `N` turns behind. The wait sits *between turns* (after the prior turn's tools finish, before the next LLM call) and is fully abortable (Ctrl+C, compaction, or session navigation cancels it), so a slow/dead advisor model can never hang the main agent. |
+| `/advisor instructions` | Open a multi-line editor for persistent advisor guidance scoped to the current project. Stored in `.pi/advisor.md`. |
+| `/advisor instructions set <text>` | Set project guidance directly (also accepts `/advisor instructions <text>` shorthand). |
+| `/advisor instructions show` / `clear` | Display or remove the current project guidance. |
 | `/advisor review` | **Manually** re-review the recent transcript now and await the result (the only synchronous path). |
 | `/advisor help` | Print the command list. |
 
-**Enable / disable** and **model selection** are fully supported and persist to `~/.pi/agent/extensions/pi-advisor.json` (so they survive restarts). The advisor also re-reads the config on each `session_start`, so changes made from another window take effect.
+**Enable / disable** and **model selection** are fully supported and persist to `~/.pi/agent/extensions/pi-advisor.json`. Project-specific advisor guidance persists separately in `<project>/.pi/advisor.md` and is loaded for every review started from that trusted project (it is ignored when Pi has not trusted the project). This keeps model/global behavior global while making review priorities portable with the project. Both scopes survive restarts. The advisor also re-reads the config on each `session_start`, so changes made from another window take effect.
 
 > **Wait / catch-up mode (`/advisor sync`).** By default (`syncLag: 0`) the advisor is **fire-and-forget**: it reviews in the background after each turn and never blocks the main agent — a late review still lands via `pi.sendMessage` whenever it finishes. Set `/advisor sync <1-6>` to make the main loop **pause at the `turn_start` boundary** when the advisor has fallen `N` turns behind (`N` = queued backlog + 1 if a review is in flight), resuming once it catches up below `N`. The gate sits *between turns*, so in-progress tool calls in the prior turn are never interrupted, and it's fully abortable — Ctrl+C, compaction, or session navigation cancels the wait, so a slow or dead advisor model can never hang the agent. This brings oh-my-pi's `syncBacklog` pause-the-agent behavior to pi via the awaited `turn_start` hook.
 
@@ -395,6 +398,7 @@ rm ~/.pi/agent/extensions/pi-advisor.json
 | `/advisor status` | Show config + last review |
 | `/advisor enable` / `disable` | Master switch (keeps the configured model) |
 | `/advisor thinking <off\|minimal\|low\|medium\|high\|xhigh>` | Set the advisor's thinking effort (`off` = disabled) |
+| `/advisor instructions [show\|set <text>\|edit\|clear]` | Manage persistent guidance in the current project's `.pi/advisor.md` |
 | `/advisor review` | Re-review the recent transcript now |
 | `/advisor help` | Show usage reference |
 
@@ -448,13 +452,13 @@ Created automatically at `~/.pi/agent/extensions/pi-advisor.json` on first chang
 
 ```bash
 pnpm install
-pnpm typecheck   # tsc --noEmit (latest pi: @earendil-works/*@0.80.2)
-pnpm test        # vitest — 66 unit tests, no API key needed
+pnpm typecheck   # tsc --noEmit (latest pi: @earendil-works/*@0.80.7)
+pnpm test        # vitest — 95 unit tests, no API key needed
 ```
 
 ### Testing
 
-The repo ships a **vitest unit suite (66 tests)** that confirms the core logic
+The repo ships a **vitest unit suite (95 tests)** that confirms the core logic
 without any network or API key — the advisor loop runs against a *scriptable
 fake `complete`*, so every code path is deterministic:
 
@@ -498,14 +502,16 @@ in print mode, confirming the full ported pipeline:
 ├── src/
 │   ├── index.ts          # Config schema, persistence, model-ref + severity helpers, <advisory> framing
 │   ├── prompts.ts        # Advisor system prompt + advise-tool description (ported from oh-my-pi)
+│   ├── project-instructions.ts # Project-scoped .pi/advisor.md persistence
 │   ├── tools.ts          # Hard-isolated read-only toolset (read/grep/find) + advise capture
 │   ├── transcript.ts     # Bounded "Session update" delta builder (convertToLlm + serializeConversation)
 │   ├── agent.ts          # The advisor agent loop (completeSimple + tools + advise capture)
 │   └── runtime.ts        # AdvisorRuntime: backlog, single-flight, epoch guards, retries, delivery
 ├── docs/
 │   └── architecture.md   # Standalone architecture + flow doc (linked from the GitHub profile)
-├── __tests__/            # vitest unit suite (66 tests, no API key needed)
+├── __tests__/            # vitest unit suite (95 tests, no API key needed)
 │   ├── agent.test.ts     # advisor loop: advise/silence/round-cap/errors/reasoning-gating
+│   ├── project-instructions.test.ts # scoped persistence + clear/limits
 │   ├── runtime.test.ts   # backlog, epoch guards, 3-strike drop, cursor seeding, delivery
 │   ├── transcript.test.ts# delta building, cursor, own-message filtering, bounding
 │   ├── tools.test.ts     # read-only tools: read/find/grep/advise, path confinement

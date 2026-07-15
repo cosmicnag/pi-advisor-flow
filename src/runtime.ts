@@ -68,6 +68,8 @@ interface PendingTurn {
 	model: Model<Api>;
 	/** Cwd the advisor explores against (the session cwd at queue time). */
 	cwd: string;
+	/** Project instructions captured at queue time. */
+	projectInstructions?: string;
 	/** Lifecycle signal: aborted on dispose/reset/compact/tree-nav/session_shutdown. */
 	signal: AbortSignal;
 }
@@ -191,6 +193,7 @@ export class AdvisorRuntime {
 			cwd: string;
 			modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
 			getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
+			projectInstructions?: string;
 		},
 	): Promise<void> {
 		if (this.disposed) return Promise.resolve();
@@ -237,6 +240,7 @@ export class AdvisorRuntime {
 			cwd: string;
 			modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
 			getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
+			projectInstructions?: string;
 		},
 	): Promise<void> {
 		const ref = this.config.advisorModel!;
@@ -273,6 +277,7 @@ export class AdvisorRuntime {
 			auth: { apiKey: auth.apiKey, headers: auth.headers },
 			model,
 			cwd: ctx.cwd,
+			projectInstructions: ctx.projectInstructions,
 			signal: this.#adoptSignal(ctx.signal),
 		};
 		this.#pending.push(turn);
@@ -341,6 +346,7 @@ export class AdvisorRuntime {
 			cwd: string;
 			modelRegistry: { find(provider: string, id: string): Model<Api> | undefined };
 			getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
+			projectInstructions?: string;
 		},
 	): Promise<AdvisorReviewResult | null> {
 		if (this.#busy) return null;
@@ -412,17 +418,18 @@ export class AdvisorRuntime {
 
 	async #runOne(turn: PendingTurn): Promise<AdvisorReviewResult> {
 		this.#lastAdvisorModel = turn.modelRef;
-		return this.#review(turn.text, turn.model, turn.auth, turn.cwd, turn.signal, this.#realDepsAdapter());
+		return this.#review(turn.text, turn.model, turn.auth, turn.cwd, turn.signal, this.#realDepsAdapter(turn));
 	}
 
 	/** Adapter that lets the injectable `review(text, ref)` test path drive the
 	 *  real loop with the per-turn-frozen model/auth/cwd/signal. */
-	#realDepsAdapter(): Parameters<typeof runAdvisorReview>[5] {
+	#realDepsAdapter(turn: PendingTurn): Parameters<typeof runAdvisorReview>[5] {
 		return {
 			thinking: this.config.thinking,
 			thinkingLevel: this.config.thinkingLevel,
 			maxToolRounds: this.config.maxToolRounds,
 			systemPrompt: this.config.systemPrompt,
+			projectInstructions: turn.projectInstructions,
 			onUsage: () => {},
 		};
 	}

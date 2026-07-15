@@ -28,6 +28,20 @@ describe("runAdvisorReview", () => {
 		expect(complete.calls[0].messages[0].role).toBe("user");
 	});
 
+	it("appends project instructions to the advisor system prompt", async () => {
+		const model = fakeModel();
+		let systemPrompt = "";
+		const complete = scriptableComplete([textAssistant("ok")], (_model, context) => {
+			systemPrompt = context.systemPrompt ?? "";
+		});
+		const t = fakeTurn(model, complete);
+		await runAdvisorReview("### Session update", t.model, t.auth, t.cwd, t.signal, {
+			...t.config,
+			projectInstructions: "Focus on API compatibility and accessibility.",
+		});
+		expect(systemPrompt).toContain("<project-advisor-instructions>");
+		expect(systemPrompt).toContain("Focus on API compatibility and accessibility.");
+	});
 	it("treats a plain text reply (no tool calls) as silence", async () => {
 		const model = fakeModel();
 		const complete = scriptableComplete([textAssistant("the agent looks on track")]);

@@ -39,9 +39,21 @@ import {
 } from "./src/index.js";
 import { AdvisorRuntime, makeHost, summarizeResult, type AdvisorRuntimeHost } from "./src/runtime.js";
 import { lastTurnFromBranch } from "./src/transcript.js";
+import { getProjectInstructionsPath, readProjectInstructions, writeProjectInstructions } from "./src/project-instructions.js";
 
 let config: AdvisorConfig = readConfig();
 let runtime: AdvisorRuntime | null = null;
+
+function projectInstructions(cwd: string, trusted = true): string | undefined {
+	if (!trusted) return undefined;
+	try {
+		const instructions = readProjectInstructions(cwd);
+		return instructions || undefined;
+	} catch {
+		// A malformed or unreadable project file must never break the main agent.
+		return undefined;
+	}
+}
 
 /** Lazily create the runtime on first use (turn_end or command). The host only
  *  needs `pi.sendMessage` (advice delivery); per-turn model/auth resolution
@@ -77,6 +89,7 @@ export default function (pi: ExtensionAPI) {
 			cwd: ctx.cwd,
 			modelRegistry: ctx.modelRegistry,
 			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
+			projectInstructions: projectInstructions(ctx.cwd, ctx.isProjectTrusted()),
 		});
 	});
 
@@ -114,7 +127,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("advisor", {
 		description: ADVISOR_COMMAND_DESCRIPTION,
 		getArgumentCompletions(prefix: string) {
-			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "sync", "help", "review"];
+			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "sync", "instructions", "help", "review"];
 			const matches = subs.filter((s) => s.startsWith(prefix));
 			return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
 		},
@@ -152,10 +165,13 @@ async function handleAdvisorCommand(
 			"                                (0 = never wait, default; 1 = after every turn)",
 				"  /advisor thinking <off|minimal|low|medium|high|xhigh>",
 				"                          Set the advisor's thinking effort (off = disabled)",
+				"  /advisor instructions [show|set <text>|edit|clear]",
+				"                          Manage persistent guidance for this project",
 				"  /advisor review        Re-review the recent transcript now",
 				"  /advisor help          This message",
 				"",
-				"Config: ~/.pi/agent/extensions/pi-advisor.json",
+				"Global config: ~/.pi/agent/extensions/pi-advisor.json",
+				`Project guidance: ${getProjectInstructionsPath(ctx.cwd)}`,
 				"Advice is delivered as <advisory severity=...> notes: nit (non-interrupting when",
 				"interrupting is off), concern/blocker (always interrupting).",
 			].join("\n"),
@@ -191,6 +207,11 @@ async function handleAdvisorCommand(
 
 	if (sub === "sync") {
 		handleSync(ctx, rest);
+		return;
+	}
+
+	if (sub === "instructions" || sub === "instruction") {
+		await handleInstructions(ctx, rest);
 		return;
 	}
 
@@ -235,6 +256,7 @@ async function handleAdvisorCommand(
 			cwd: ctx.cwd,
 			modelRegistry: ctx.modelRegistry,
 			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
+			projectInstructions: projectInstructions(ctx.cwd, ctx.isProjectTrusted()),
 		});
 		ctx.ui.notify(summarizeResult(result), result?.error ? "warning" : "info");
 		return;
@@ -260,6 +282,69 @@ function updateConfig(
 	ctx.ui.notify(`${message} (config: ${path})`, "info");
 }
 
+async function handleInstructions(ctx: ExtensionCommandContext, rest: string): Promise<void> {
+	if (!ctx.isProjectTrusted()) {
+		ctx.ui.notify("Project advisor instructions are disabled until this project is trusted.", "error");
+		return;
+	}
+
+	const input = rest.trim();
+	const [actionRaw, ...tail] = input.split(/\s+/);
+	const action = actionRaw?.toLowerCase() || (ctx.hasUI ? "edit" : "show");
+	const path = getProjectInstructionsPath(ctx.cwd);
+
+	try {
+		if (action === "show") {
+			const current = readProjectInstructions(ctx.cwd);
+			ctx.ui.notify(current ? `Advisor instructions for this project:\n\n${current}\n\n${path}` : `No advisor instructions set for this project.\n${path}`, "info");
+			return;
+		}
+
+		if (action === "clear" || action === "remove" || action === "reset") {
+			writeProjectInstructions(ctx.cwd, "");
+			runtime?.reset();
+			ctx.ui.notify(`Cleared project advisor instructions. (${path})`, "info");
+			return;
+		}
+
+		if (action === "set" || action === "add") {
+			const text = tail.join(" ").trim();
+			if (!text) {
+				ctx.ui.notify("Usage: /advisor instructions set <text>", "warning");
+				return;
+			}
+			writeProjectInstructions(ctx.cwd, text);
+			runtime?.reset();
+			ctx.ui.notify(`Saved project advisor instructions. (${path})`, "info");
+			return;
+		}
+
+		if (action === "edit") {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("Interactive editing is unavailable. Use /advisor instructions set <text>.", "error");
+				return;
+			}
+			const current = readProjectInstructions(ctx.cwd);
+			const edited = await ctx.ui.editor("Advisor instructions for this project (submit empty to clear)", current);
+			if (edited === undefined) {
+				ctx.ui.notify("Advisor instructions unchanged.", "info");
+				return;
+			}
+			const normalized = edited.trim();
+			writeProjectInstructions(ctx.cwd, normalized);
+			runtime?.reset();
+			ctx.ui.notify(normalized ? `Saved project advisor instructions. (${path})` : `Cleared project advisor instructions. (${path})`, "info");
+			return;
+		}
+
+		// Friendly shorthand: `/advisor instructions prefer tests first`.
+		writeProjectInstructions(ctx.cwd, input);
+		runtime?.reset();
+		ctx.ui.notify(`Saved project advisor instructions. (${path})`, "info");
+	} catch (error) {
+		ctx.ui.notify(`Could not update advisor instructions: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}
+}
 function handleThinking(ctx: ExtensionCommandContext, rest: string): void {
 	const arg = rest.trim().toLowerCase();
 	if (!arg) {
@@ -406,6 +491,9 @@ function showStatus(ctx: ExtensionCommandContext): void {
 	lines.push(`Advisor: ${config.enabled ? "enabled" : "disabled"}`);
 	lines.push(`Advisor model: ${config.advisorModel ?? "(none — pick one with /advisor)"}`);
 	lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
+	const projectTrusted = ctx.isProjectTrusted();
+	const instructions = projectInstructions(ctx.cwd, projectTrusted);
+	lines.push(`Project instructions: ${projectTrusted ? (instructions ? `active (${instructions.length} chars)` : "none") : "ignored (project not trusted)"} (${getProjectInstructionsPath(ctx.cwd)})`);
 	lines.push(`Context window: ~${config.contextChars} chars · max ${config.maxToolRounds} tool rounds${config.cooldownMs > 0 ? ` · cooldown ${config.cooldownMs}ms` : ""}`);
 	lines.push(`Delivery: ${config.interrupting ? "ALL advice interrupts" : "nit → non-interrupting, concern/blocker → interrupting"} (steer${config.interrupting ? " + triggerTurn" : " + triggerTurn for concern/blocker"})`);
 
