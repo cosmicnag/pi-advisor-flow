@@ -82,4 +82,18 @@ describe("AdvisorModelSelectorComponent", () => {
 		const c = new AdvisorModelSelectorComponent(fakeTheme, fakeModels, null, () => {});
 		expect(c.render(80).join("\n")).toContain("🖼️");
 	});
+
+	it("never defaults the highlight to the 'None' row when the current model isn't listed", () => {
+		// Regression: a configured model not enumerated by the registry made
+		// findIndex return -1, dropping the highlight onto the index-0 "None"
+		// row — a stray Enter then silently disabled the advisor. The highlight must
+		// land on the first REAL model instead.
+		const c = new AdvisorModelSelectorComponent(fakeTheme, fakeModels, "nonexistent/model", () => {});
+		const out = c.render(80).join("\n");
+		// The 'None' row is present but NOT the highlighted ("→ ") row.
+		expect(out).toContain("None");
+		expect(out).not.toContain("→ None");
+		// A real model is highlighted instead.
+		expect(out).toMatch(/→ \S+/);
+	});
 });

@@ -295,8 +295,13 @@ export class AdvisorModelSelectorComponent implements Component {
 		this.currentRef = currentRef;
 		this.allItems = this.buildItems(models, currentRef);
 		this.filteredItems = this.allItems;
+		// Initial highlight: the current model if it's in the list; otherwise the
+		// FIRST real model (index 1, since index 0 is the synthetic "None" row).
+		// We deliberately never default to "None": a stray Enter on a pre-highlighted
+		// "None" would silently disable the advisor (the trap that bit users whose
+		// configured model isn't enumerated by the registry, where findIndex = -1).
 		const start = this.allItems.findIndex((i) => i.ref === currentRef);
-		this.selectedIndex = start >= 0 ? start : 0;
+		this.selectedIndex = start >= 0 ? start : Math.min(1, this.allItems.length - 1);
 		this.searchInput = new Input();
 		this.listContainer = new Container();
 		this.footerText = new Text(this.footer(), 0, 0);
