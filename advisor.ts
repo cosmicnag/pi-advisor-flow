@@ -226,15 +226,128 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("advisor", {
 		description: ADVISOR_COMMAND_DESCRIPTION,
-		getArgumentCompletions(prefix: string) {
-			const subs = ["model", "status", "enable", "disable", "thinking", "interrupting", "sync", "context", "instructions", "help", "review"];
-			const matches = subs.filter((s) => s.startsWith(prefix));
-			return matches.length > 0 ? matches.map((s) => ({ value: s, label: s })) : null;
+		getArgumentCompletions(arg: string) {
+			return completeAdvisorArgs(arg);
 		},
 		handler: async (args, ctx) => {
 			await handleAdvisorCommand(pi, ctx, args.trim());
 		},
 	});
+}
+
+/** Top-level /advisor subcommands with one-line descriptions, shown as
+ *  autocomplete suggestions in the TUI. Order = display order. Aliases accepted
+ *  by the dispatcher (trigger/instruction singular) are intentionally NOT
+ *  suggested — the canonical plural forms are. */
+const ADVISOR_SUBCOMMANDS: { value: string; description: string }[] = [
+	{ value: "model", description: "Set the advisor model directly (provider/id)" },
+	{ value: "status", description: "Show config, triggers, instructions, and last review" },
+	{ value: "enable", description: "Enable the advisor" },
+	{ value: "disable", description: "Disable the advisor (keeps the model)" },
+	{ value: "interrupting", description: "Toggle whether ALL advice interrupts (default: on)" },
+	{ value: "sync", description: "Wait for the advisor when it falls N turns behind (0-6)" },
+	{ value: "context", description: "Inspect or set the rolling transcript budget" },
+	{ value: "thinking", description: "Set the advisor thinking effort (off|minimal|low|medium|high|xhigh)" },
+	{ value: "triggers", description: "Toggle review triggers (default: turn_end, tool_error)" },
+	{ value: "instructions", description: "Manage project + global advisor guidance and active mode" },
+	{ value: "review", description: "Re-review the recent transcript now" },
+	{ value: "help", description: "Show all advisor commands" },
+];
+
+const INSTRUCTIONS_ACTIONS: { value: string; description: string }[] = [
+	{ value: "show", description: "Print the active project instructions" },
+	{ value: "set", description: "Set project instructions from the following text" },
+	{ value: "edit", description: "Open a multi-line editor for project instructions" },
+	{ value: "clear", description: "Remove project instructions" },
+	{ value: "global", description: "Manage the cross-repo global instructions file" },
+	{ value: "mode", description: "Pick active source: project | global | none" },
+];
+
+const GLOBAL_ACTIONS: { value: string; description: string }[] = [
+	{ value: "show", description: "Print the global instructions" },
+	{ value: "set", description: "Set global instructions from the following text" },
+	{ value: "edit", description: "Open a multi-line editor for global instructions" },
+	{ value: "clear", description: "Remove global instructions" },
+];
+
+const INSTRUCTIONS_MODES: { value: string; description: string }[] = [
+	{ value: "project", description: "Use per-repo .pi/advisor.md (default; opt-out of global)" },
+	{ value: "global", description: "Use the cross-repo global file" },
+	{ value: "none", description: "Use neither source" },
+];
+
+/** Tokenize the argument string typed so far into completed tokens + the
+ *  partial token under the cursor.
+ *  - arg=""            -> { completed: [], partial: "" }
+ *  - arg="tr"          -> { completed: [], partial: "tr" }
+ *  - arg="instructions " -> { completed: ["instructions"], partial: "" }
+ *  - arg="instructions g" -> { completed: ["instructions"], partial: "g" } */
+function tokenizeArgs(arg: string): { completed: string[]; partial: string } {
+	const trimmed = arg.replace(/\s+$/, "");
+	const hasTrailingSpace = trimmed.length < arg.length;
+	const parts = trimmed.length ? trimmed.split(/\s+/) : [];
+	if (hasTrailingSpace) return { completed: parts, partial: "" };
+	const partial = parts.length ? parts[parts.length - 1] : "";
+	return { completed: parts.slice(0, -1), partial };
+}
+
+/** Build AutocompleteItem[] where `value` is the FULL argument string to
+ *  substitute (pi replaces the entire argument text with item.value). */
+function buildItems(
+	completed: string[],
+	partial: string,
+	candidates: { value: string; description: string }[],
+) {
+	const prefix = completed.length ? `${completed.join(" ")} ` : "";
+	const matches = candidates.filter((c) => c.value.startsWith(partial));
+	if (matches.length === 0) return null;
+	return matches.map((c) => ({ value: `${prefix}${c.value}`, label: c.value, description: c.description }));
+}
+
+/** Context-aware autocomplete for `/advisor …`. Returns suggestions for the
+ *  top-level subcommand list and, where useful, for nested arguments
+ *  (`instructions global …`, `instructions mode …`, `triggers <name>`). The
+ *  `enabled` set (defaults to the live config) only annotates trigger labels
+ *  with [on]/[off]; it is passed in so the function stays pure and testable. */
+export function completeAdvisorArgs(arg: string, enabled: string[] = config.triggers) {
+	const enabledSet = new Set(enabled);
+	const { completed, partial } = tokenizeArgs(arg);
+
+	// Depth 1: completing the first subcommand token.
+	if (completed.length === 0) {
+		return buildItems([], partial, ADVISOR_SUBCOMMANDS);
+	}
+
+	const head = completed[0];
+
+	// `triggers [name]` — depth 2 offers the toggleable trigger names.
+	if ((head === "triggers" || head === "trigger") && completed.length === 1) {
+		const candidates = ADVISOR_TRIGGERS.map((t) => ({
+			value: t,
+			description: `${enabledSet.has(t) ? "[on]  " : "[off] "}${ADVISOR_TRIGGER_LABELS[t]}`,
+		}));
+		return buildItems([completed[0]], partial, candidates);
+	}
+
+	// `instructions [action|global|mode] …`
+	if (head === "instructions" || head === "instruction") {
+		// Depth 2: the instructions action/group.
+		if (completed.length === 1) {
+			return buildItems([completed[0]], partial, INSTRUCTIONS_ACTIONS);
+		}
+		const sub = completed[1];
+		// `instructions global [action]`
+		if (sub === "global" && completed.length === 2) {
+			return buildItems([completed[0], "global"], partial, GLOBAL_ACTIONS);
+		}
+		// `instructions mode <project|global|none>`
+		if (sub === "mode" && completed.length === 2) {
+			return buildItems([completed[0], "mode"], partial, INSTRUCTIONS_MODES);
+		}
+		return null;
+	}
+
+	return null;
 }
 
 async function handleAdvisorCommand(
