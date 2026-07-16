@@ -44,6 +44,9 @@ import {
 	type AdvisorConfig,
 	type AdvisorTrigger,
 } from "./src/index.js";
+import { AdvisorModelSelectorComponent, TriggersSelectorComponent, type TriggersSelectorResult, type ModelSelectorResult } from "./src/ui.js";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { TUI, KeybindingsManager } from "@earendil-works/pi-tui";
 import { AdvisorRuntime, makeHost, summarizeResult, type AdvisorRuntimeHost } from "./src/runtime.js";
 import { lastTurnFromBranch } from "./src/transcript.js";
 import { getProjectInstructionsPath, readProjectInstructions, writeProjectInstructions } from "./src/project-instructions.js";
@@ -675,21 +678,16 @@ function handleInstructionsMode(ctx: ExtensionCommandContext, arg: string): void
 	updateConfig(ctx, (c) => ({ ...c, instructionsMode: mode }), `Instructions mode set to ${mode}.`);
 }
 
-/** Toggle-menu for review triggers (multi-select). No native multiselect in
- *  ctx.ui, so loop a single `select` until the user accepts. Persisted to the
- *  global config. Capture always runs on turn_end; these only gate scheduling. */
+/** Toggle-menu for review triggers (multi-select). A fuzzy-searchable,
+ *  scrollable TUI (built on pi-tui): up/down to move, tab to toggle a row,
+ *  enter/ctrl+s to save, esc to cancel. Persisted to the global config.
+ *  Capture always runs on turn_end; these only gate scheduling. */
 async function handleTriggers(ctx: ExtensionCommandContext, _rest: string): Promise<void> {
 	if (!ctx.hasUI) {
 		const list = ADVISOR_TRIGGERS.map((t) => `[${config.triggers.includes(t) ? "x" : " "}] ${t} — ${ADVISOR_TRIGGER_LABELS[t]}`);
 		ctx.ui.notify(`Triggers (interactive menu needs a TTY):\n${list.join("\n")}\nUse /advisor triggers <name> to toggle a single trigger.`, "info");
 		return;
 	}
-	const toggle = (t: AdvisorTrigger): AdvisorTrigger[] => {
-		const has = config.triggers.includes(t);
-		return has ? config.triggers.filter((x) => x !== t) : [...config.triggers, t];
-	};
-	const render = () =>
-		ADVISOR_TRIGGERS.map((t) => `${config.triggers.includes(t) ? "[x]" : "[ ]"} ${t} — ${ADVISOR_TRIGGER_LABELS[t]}`);
 
 	// Single-trigger shorthand: /advisor triggers <name>
 	const rest = _rest.trim().toLowerCase() as AdvisorTrigger;
@@ -698,7 +696,8 @@ async function handleTriggers(ctx: ExtensionCommandContext, _rest: string): Prom
 			ctx.ui.notify(`Unknown trigger: "${_rest}". Options: ${ADVISOR_TRIGGERS.join(", ")}.`, "error");
 			return;
 		}
-		const next = toggle(rest);
+		const has = config.triggers.includes(rest);
+		const next = has ? config.triggers.filter((x) => x !== rest) : [...config.triggers, rest];
 		if (next.length === 0) {
 			ctx.ui.notify("At least one trigger must stay enabled.", "warning");
 			return;
@@ -711,29 +710,24 @@ async function handleTriggers(ctx: ExtensionCommandContext, _rest: string): Prom
 		return;
 	}
 
-	while (true) {
-		const items = [
-			...render(),
-			"",
-			"✓ Done",
-		];
-		const choice = await ctx.ui.select("Toggle review triggers (capture always runs on turn_end):", items);
-		if (choice === undefined || choice === `✓ Done` || choice === "") {
-			ctx.ui.notify(`Triggers: ${config.triggers.join(", ") || "(none)"}.`, "info");
-			return;
-		}
-		const name = choice.split(" ")[1] as AdvisorTrigger;
-		if (!ADVISOR_TRIGGERS.includes(name)) continue;
-		const next = toggle(name);
-		if (next.length === 0) {
-			ctx.ui.notify("At least one trigger must stay enabled.", "warning");
-			continue;
-		}
-		// Apply in-memory immediately so the next render reflects the toggle.
-		config.triggers = next;
-		writeConfig(config);
-		// No reset needed: the runtime reads config.triggers live via #has().
+	const result = await ctx.ui.custom<TriggersSelectorResult>(
+		(
+			_tui: TUI,
+			theme: Theme,
+			_kb: KeybindingsManager,
+			done: (result: TriggersSelectorResult) => void,
+		) => {
+			return new TriggersSelectorComponent(theme, config.triggers, done);
+		},
+	);
+	if (result.cancelled) {
+		ctx.ui.notify("Triggers unchanged.", "info");
+		return;
 	}
+	// The component guarantees ≥1; write live (no reset, runtime reads it live).
+	config.triggers = result.triggers;
+	writeConfig(config);
+	ctx.ui.notify(`Triggers: ${result.triggers.join(", ")}.`, "info");
 }
 function handleThinking(ctx: ExtensionCommandContext, rest: string): void {
 	const arg = rest.trim().toLowerCase();
@@ -843,8 +837,11 @@ function handleSync(ctx: ExtensionCommandContext, rest: string): void {
 	);
 }
 
-/** Interactive model picker. Lists every available (auth-configured) model,
- *  reasoning-capable and currently-selected ones first. */
+/** Interactive model picker. A fuzzy-searchable, scrollable TUI (built on
+ *  pi-tui) listing every available model — reasoning-capable + current ones
+ *  float to the top, the current model is marked ✓, and a leading "None"
+ *  row clears the advisor. Replaces the old flat ctx.ui.select list that was
+ *  too long to scan. */
 async function showPicker(ctx: ExtensionCommandContext): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("/advisor requires interactive mode.", "error");
@@ -858,47 +855,34 @@ async function showPicker(ctx: ExtensionCommandContext): Promise<void> {
 	}
 
 	const current = config.advisorModel;
-	// Sort: current first, then reasoning-capable, then by provider/id.
-	const sorted = [...models].sort((a, b) => {
-		const aRef = formatModelRef(a.provider, a.id);
-		const bRef = formatModelRef(b.provider, b.id);
-		const aCur = aRef === current ? 0 : 1;
-		const bCur = bRef === current ? 0 : 1;
-		if (aCur !== bCur) return aCur - bCur;
-		const aReason = a.reasoning ? 0 : 1;
-		const bReason = b.reasoning ? 0 : 1;
-		if (aReason !== bReason) return aReason - bReason;
-		return aRef.localeCompare(bRef);
-	});
+	const result = await ctx.ui.custom<ModelSelectorResult>(
+		(
+			_tui: TUI,
+			theme: Theme,
+			_kb: KeybindingsManager,
+			done: (result: ModelSelectorResult) => void,
+		) => {
+			return new AdvisorModelSelectorComponent(theme, models, current, done);
+		},
+	);
 
-	const options = sorted.map((m) => {
-		const ref = formatModelRef(m.provider, m.id);
-		const tags: string[] = [];
-		if (m.reasoning) tags.push("reasoning");
-		if (ref === current) tags.push("current");
-		return tags.length > 0 ? `${ref}  [${tags.join(", ")}]` : ref;
-	});
-
-	const title =
-		(current ? `Advisor model (current: ${current})` : "Pick an advisor model") +
-		" — Enter to select, Esc to cancel";
-
-	const choice = await ctx.ui.select(title, options);
-	if (!choice) {
+	if (result.cancelled) {
 		ctx.ui.notify("Advisor picker cancelled.", "info");
 		return;
 	}
-
-	// The option is the ref, optionally followed by a "  [tags]" suffix.
-	const ref = choice.split(/\s+\[/)[0].trim();
-	const parsed = parseModelRef(ref);
+	if (result.ref === null) {
+		// "None" row: disable without erasing the stored ref, so toggling back is cheap.
+		updateConfig(ctx, (c) => ({ ...c, enabled: false }), "Advisor disabled.");
+		return;
+	}
+	const parsed = parseModelRef(result.ref);
 	if (!parsed) {
-		ctx.ui.notify(`Could not parse selection: "${choice}".`, "error");
+		ctx.ui.notify(`Could not parse selection: "${result.ref}".`, "error");
 		return;
 	}
 	const model = ctx.modelRegistry.find(parsed.provider, parsed.id);
 	if (!model) {
-		ctx.ui.notify(`Model not found: ${ref}.`, "error");
+		ctx.ui.notify(`Model not found: ${result.ref}.`, "error");
 		return;
 	}
 	const finalRef = formatModelRef(parsed.provider, parsed.id);

@@ -184,9 +184,13 @@ review points or turn others off — capture of each finalized turn always runs
 on `turn_end` regardless, so switching triggers never loses context.
 
 ```text
-/advisor triggers              # open the toggle menu
+/advisor triggers              # open the fuzzy-searchable toggle menu
 /advisor triggers agent_settled  # toggle one trigger by name
 ```
+
+The menu is a keyboard-driven multi-select: type to filter, ↑/↓ to move, `tab`
+to toggle a row, `enter`/`ctrl+s` to save (at least one must stay on), `esc` to
+cancel. Changes persist to the global config.
 
 | Trigger | Fires |
 |---|---|
@@ -206,7 +210,7 @@ mid-run inactivity; a fluid run that never pauses fires nothing from it.
 
 | Command | Description |
 |---|---|
-| `/advisor` | Open the advisor model picker |
+| `/advisor` | Open the advisor model picker (fuzzy-searchable TUI) |
 | `/advisor model <provider/id>` | Set the advisor model directly |
 | `/advisor status` | Show configuration, backlog, and the last review result |
 | `/advisor enable` / `disable` | Enable or disable reviews while keeping the selected model |
