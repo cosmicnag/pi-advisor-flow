@@ -187,6 +187,16 @@ describe("AdvisorRuntime — happy path", () => {
 		expect(sendAdvice).not.toHaveBeenCalled();
 	});
 
+	it("records a model-registry auth exception instead of rejecting a background trigger", async () => {
+		const review = vi.fn(async () => ({ advise: null, rounds: 0 }));
+		const { rt, ctx } = makeRuntime(review as never);
+		ctx.getApiKeyAndHeaders = async () => { throw new Error("auth lookup failed"); };
+		const t = turn("hi");
+		await expect(rt.onTurnEnd(t.message as AgentMessage, t.toolResults, [entry("user", "hi")], ctx)).resolves.toBeUndefined();
+		expect(review).not.toHaveBeenCalled();
+		expect(rt.lastResult?.error).toBe("auth lookup failed");
+	});
+
 	it("stays silent (no delivery) when the advisor review returns no advise", async () => {
 		const { rt, sendAdvice, ctx } = makeRuntime(async () => ({ advise: null, rounds: 0 }));
 		const t = turn("all good");
@@ -607,6 +617,32 @@ describe("AdvisorRuntime — selectable triggers", () => {
 		await settle(rt);
 		expect(sendAdvice).toHaveBeenCalledTimes(1);
 		expect(sendAdvice.mock.calls[0][0][0].note).toBe("fresh");
+	});
+
+	it("latest-wins: a stale failure neither retries nor drops the newer pending review", async () => {
+		const { review, calls, release } = hangingReview();
+		const { rt, ctx, sendAdvice } = makeRuntime(review, [], { maxRetries: 3 });
+		const stale = turn("stale-turn");
+		void rt.onTurnEnd(stale.message as AgentMessage, stale.toolResults, [entry("user", "stale")], ctx);
+		await flush();
+
+		const fresh = turn("fresh-turn");
+		void rt.onTurnEnd(fresh.message as AgentMessage, fresh.toolResults, [entry("user", "fresh")], ctx);
+		await flush();
+		expect(calls).toHaveLength(1);
+
+		// The stale error is discarded immediately. It must not be unshifted for
+		// retries ahead of the fresh snapshot or clear that snapshot on strike 3.
+		release({ advise: null, rounds: 0, error: "stale timeout" });
+		await flush();
+		expect(calls).toHaveLength(2);
+		release({ advise: { note: "fresh survives", severity: "concern" }, rounds: 1 });
+		await settle(rt);
+
+		expect(calls).toHaveLength(2);
+		expect(sendAdvice).toHaveBeenCalledTimes(1);
+		expect(sendAdvice.mock.calls[0][0][0].note).toBe("fresh survives");
+		expect(rt.lastResult?.error).toBeUndefined();
 	});
 
 	it("mid_pause: trailing debounce fires once after a quiet period, not on every token", async () => {

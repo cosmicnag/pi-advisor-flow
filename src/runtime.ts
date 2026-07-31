@@ -423,7 +423,20 @@ export class AdvisorRuntime {
 			this.#lastResult = { advise: null, rounds: 0, error: `Advisor model not found: ${ref}` };
 			return;
 		}
-		const auth = await ctx.getApiKeyAndHeaders(model);
+		let auth: Awaited<ReturnType<ReviewCtx["getApiKeyAndHeaders"]>>;
+		try {
+			auth = await ctx.getApiKeyAndHeaders(model);
+		} catch (error) {
+			// Event-triggered reviews are deliberately fire-and-forget so the advisor
+			// does not stall pi. Convert registry/auth exceptions into observable
+			// status instead of leaving an unhandled rejection and "no review yet".
+			this.#lastResult = {
+				advise: null,
+				rounds: 0,
+				error: error instanceof Error ? error.message : String(error),
+			};
+			return;
+		}
 		// A newer review already committed (bumped the generation) during this
 		// await — drop this older one so it can't overwrite the fresher snapshot.
 		if (this.#generation !== startGen) return;
@@ -564,6 +577,11 @@ export class AdvisorRuntime {
 				this.#lastReviewAt = Date.now();
 				const result = await this.#runOne(batch);
 				if (this.#epoch !== epoch) continue; // reset during review
+				// A newer trigger arrived while this call was in flight. Discard the
+				// entire stale outcome (including errors) before retry/accounting. A
+				// stale failure must never consume retries or clear the newer pending
+				// snapshot after maxRetries.
+				if (batch.gen !== this.#generation) continue;
 
 				if (result.error) {
 					this.#consecutiveFailures++;
@@ -586,9 +604,6 @@ export class AdvisorRuntime {
 				this.#consecutiveFailures = 0;
 				this.#lastResult = result;
 				if (result.advise) {
-					// Latest-wins delivery suppression: if a newer request superseded
-					// this batch while it was in flight, drop the stale result.
-					if (batch.gen !== this.#generation) continue;
 					const note: AdvisorNote = { note: result.advise.note, severity: result.advise.severity };
 					const key = adviceKey(note.note);
 					// B5: hard dedupe at delivery. Skip repeats outright.
