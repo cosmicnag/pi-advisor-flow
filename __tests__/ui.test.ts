@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { TriggersSelectorComponent, AdvisorModelSelectorComponent } from "../src/ui.js";
 import { DEFAULT_TRIGGERS } from "../src/index.js";
 
@@ -18,6 +19,12 @@ const fakeTheme = {
 	fg: (_color: string, str: string) => str,
 	bold: (str: string) => str,
 } as unknown as ConstructorParameters<typeof TriggersSelectorComponent>[0];
+
+function expectLinesWithinWidth(lines: string[], width: number): void {
+	for (const line of lines) {
+		expect(visibleWidth(line), `overwide line at width ${width}: ${line}`).toBeLessThanOrEqual(width);
+	}
+}
 
 const fakeModels: { provider: string; id: string; name: string; reasoning: boolean; input: ("text" | "image")[]; contextWindow: number; maxTokens: number }[] = [
 	{ provider: "anthropic", id: "claude-sonnet-4", name: "Claude Sonnet 4", reasoning: true, input: ["text", "image"], contextWindow: 200_000, maxTokens: 8192 },
@@ -45,6 +52,12 @@ describe("TriggersSelectorComponent", () => {
 		const out = c.render(80).join("\n");
 		expect(out).toContain("[x] turn_end");
 		expect(out).toContain("[ ] tool_result"); // not enabled
+	});
+
+	it("never renders a line wider than the terminal", () => {
+		const c = new TriggersSelectorComponent(fakeTheme, [...DEFAULT_TRIGGERS], () => {});
+		// Regression: the 95-column explanatory line crashed pi at width 79.
+		for (const width of [79, 40, 20]) expectLinesWithinWidth(c.render(width), width);
 	});
 
 	it("does not throw on invalidate", () => {
@@ -81,6 +94,11 @@ describe("AdvisorModelSelectorComponent", () => {
 	it("renders a vision badge for image-capable models", () => {
 		const c = new AdvisorModelSelectorComponent(fakeTheme, fakeModels, null, () => {});
 		expect(c.render(80).join("\n")).toContain("🖼️");
+	});
+
+	it("never renders a line wider than the terminal", () => {
+		const c = new AdvisorModelSelectorComponent(fakeTheme, fakeModels, "anthropic/claude-sonnet-4", () => {});
+		for (const width of [79, 40, 20]) expectLinesWithinWidth(c.render(width), width);
 	});
 
 	it("never defaults the highlight to the 'None' row when the current model isn't listed", () => {

@@ -17,6 +17,9 @@ import {
 	matchesKey,
 	Spacer,
 	Text,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { DynamicBorder, keyText, type Theme } from "@earendil-works/pi-coding-agent";
 import {
@@ -41,6 +44,21 @@ interface TriggerItem {
 	trigger: AdvisorTrigger;
 	label: string;
 	description: string;
+}
+
+/**
+ * Final width guard for custom TUI output.
+ *
+ * pi 0.83 treats any custom-component line wider than `render(width)` as a
+ * fatal rendering error. Built-in Text/Input components already honor width,
+ * but direct styled strings (headings, hints) do not. Keep this guard at the
+ * component boundary so future copy changes cannot crash the entire TUI.
+ */
+function fitToWidth(lines: string[], width: number): string[] {
+	const maxWidth = Math.max(1, width);
+	return lines.map((line) => visibleWidth(line) > maxWidth
+		? truncateToWidth(line, maxWidth, "")
+		: line);
 }
 
 export class TriggersSelectorComponent implements Component {
@@ -87,12 +105,13 @@ export class TriggersSelectorComponent implements Component {
 		lines.push(...border.render(width));
 		lines.push("");
 		lines.push(this.theme.fg("accent", this.theme.bold("Advisor triggers")));
-		lines.push(
+		lines.push(...wrapTextWithAnsi(
 			this.theme.fg(
 				"muted",
 				"Capture always runs on turn_end; these pick which moments DO review. At least one must stay on.",
 			),
-		);
+			Math.max(1, width),
+		));
 		lines.push("");
 		lines.push(...this.searchInput.render(width));
 		lines.push("");
@@ -100,7 +119,7 @@ export class TriggersSelectorComponent implements Component {
 		lines.push("");
 		lines.push(...this.footerText.render(width));
 		lines.push(...border.render(width));
-		return lines;
+		return fitToWidth(lines, width);
 	}
 
 	handleInput(data: string): void {
@@ -318,7 +337,10 @@ export class AdvisorModelSelectorComponent implements Component {
 		lines.push(...border.render(width));
 		lines.push("");
 		lines.push(this.theme.fg("accent", this.theme.bold("Advisor model")));
-		lines.push(this.theme.fg("muted", "Pick a second model to peer-review each turn. Type to filter."));
+		lines.push(...wrapTextWithAnsi(
+			this.theme.fg("muted", "Pick a second model to peer-review each turn. Type to filter."),
+			Math.max(1, width),
+		));
 		lines.push("");
 		lines.push(...this.searchInput.render(width));
 		lines.push("");
@@ -326,7 +348,7 @@ export class AdvisorModelSelectorComponent implements Component {
 		lines.push("");
 		lines.push(...this.footerText.render(width));
 		lines.push(...border.render(width));
-		return lines;
+		return fitToWidth(lines, width);
 	}
 
 	handleInput(data: string): void {
