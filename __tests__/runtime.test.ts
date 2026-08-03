@@ -97,7 +97,7 @@ const FAKE_MODEL: Model<Api> = {
 function makeRuntime(
 	review: ReviewFn,
 	branch: SessionEntry[] = [],
-	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number; syncLag: number; triggers: AdvisorTrigger[]; midPauseMs: number }> = {},
+	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number; syncLag: number; triggers: AdvisorTrigger[]; midPauseMs: number; armForTasks: boolean }> = {},
 ) {
 	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string, _opts?: { forceNonTriggering?: boolean }) => {});
 	const host = { sendAdvice };
@@ -105,6 +105,7 @@ function makeRuntime(
 		host as never,
 		{
 		enabled: config.enabled ?? true,
+			armForTasks: config.armForTasks ?? false,
 			advisorModel: config.advisorModel === undefined ? "fake/fake" : config.advisorModel,
 			thinking: false,
 			thinkingLevel: "medium" as const,

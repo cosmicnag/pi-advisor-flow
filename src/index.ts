@@ -6,7 +6,7 @@
  * settings.json is touched.
  */
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readProjectInstructions } from "./project-instructions.js";
 import { readGlobalInstructions } from "./global-instructions.js";
@@ -160,6 +160,13 @@ export const MAX_MID_PAUSE_MS = 60_000;
 export interface AdvisorConfig {
 	/** Master switch. When false, no review occurs even if a model is configured. */
 	enabled: boolean;
+	/** Arm-for-tasks: when true, the advisor auto-enables inside pi-supergsd
+	 *  push-task leaf branches (detected via `task-start`/`task-done` custom
+	 *  entries) and auto-disables when the branch leaves the task. Enabling is a
+	 *  RUNTIME mutation only — the transient `enabled: true` is never persisted,
+	 *  so a mid-task pi restart resumes with the advisor off (the file keeps
+	 *  `enabled: false + armForTasks: true`). See `branchHasTaskStart`. */
+	armForTasks: boolean;
 	/** The advisor model, as "provider/id". null = not configured (advisor inactive). */
 	advisorModel: string | null;
 	/**
@@ -237,6 +244,7 @@ export function parseAdvisorContextSize(value: string): number | null {
 
 export const DEFAULT_CONFIG: AdvisorConfig = {
 	enabled: true,
+	armForTasks: false,
 	advisorModel: null,
 	thinking: false,
 	thinkingLevel: "medium",
@@ -295,6 +303,7 @@ export function normalizeConfig(raw: unknown): AdvisorConfig {
 	const obj = raw as Record<string, unknown>;
 
 	if (typeof obj.enabled === "boolean") base.enabled = obj.enabled;
+	if (typeof obj.armForTasks === "boolean") base.armForTasks = obj.armForTasks;
 	if (typeof obj.advisorModel === "string" && obj.advisorModel.trim()) {
 		base.advisorModel = parseModelRef(obj.advisorModel) ? obj.advisorModel.trim() : null;
 	} else if (obj.advisorModel === null) {
@@ -387,6 +396,30 @@ export function writeConfig(config: AdvisorConfig): string {
 	}
 	writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf8");
 	return path;
+}
+
+/** Whether the current session branch is inside a pi-supergsd push-task:
+ *  true when an unmatched `task-start` custom entry exists in the branch.
+ *
+ *  A DEPTH COUNTER (not a boolean flip) so nested tasks behave: pi-supergsd
+ *  supports push-task inside an active task, and finishing the INNER task must
+ *  not disable the advisor while the OUTER task is still active. The counter
+ *  clamps at 0 because `discardTask` appends a `task-done` with no matching
+ *  `task-start` (pi-supergsd src/index.ts:383) — without clamping that would
+ *  underflow into "inside a task".
+ *
+ *  Entry-type strings are hardcoded (pi-supergsd keeps `TASK_START_ENTRY_TYPE`/
+ *  `TASK_DONE_ENTRY_TYPE` module-private, src/index.ts:631/576). If pi-supergsd
+ *  ever renames them, this helper silently returns false — drift-protect by
+ *  keeping this comment pointing at the pi-supergsd lines. */
+export function branchHasTaskStart(ctx: ExtensionContext): boolean {
+	const branch = ctx.sessionManager.getBranch();
+	let depth = 0;
+	for (const entry of branch) {
+		if (entry.type === "custom" && entry.customType === "task-start") depth++;
+		if (entry.type === "custom" && entry.customType === "task-done") depth = Math.max(0, depth - 1);
+	}
+	return depth > 0;
 }
 
 /** Resolve the active advisor instructions text for a given config + cwd,

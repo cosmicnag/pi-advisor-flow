@@ -35,6 +35,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { runAdvisorReview, type AdvisorReviewResult } from "./agent.js";
+import { redactSecrets } from "./redaction.js";
 import { buildSessionUpdate, serializeTurn } from "./transcript.js";
 import {
 	ADVISOR_CUSTOM_TYPE,
@@ -385,10 +386,15 @@ export class AdvisorRuntime {
 			if (serialized) this.#pushContext(serialized);
 		}
 	}
-	/** Append a serialized turn to the rolling buffer, evicting oldest by chars. */
+	/** Append a serialized turn to the rolling buffer, evicting oldest by chars.
+	 *  Secrets are redacted HERE (not only at requestReview) so the buffer itself
+	 *  never holds raw tool stdout / file contents / API responses — any future
+	 *  consumer of the buffer is protected by construction, and `#captureNewUserMessages`
+	 *  (which pushes user prompts verbatim) gets the same treatment. */
 	#pushContext(serialized: string): void {
-		this.#contextBuffer.push(serialized);
-		this.#contextChars += serialized.length + 4; // join separator slop
+		const { text } = redactSecrets(serialized);
+		this.#contextBuffer.push(text);
+		this.#contextChars += text.length + 4; // join separator slop
 		const cap = Math.max(512, this.config.contextChars);
 		while (this.#contextChars > cap && this.#contextBuffer.length > 1) {
 			const evicted = this.#contextBuffer.shift()!;
@@ -461,7 +467,16 @@ export class AdvisorRuntime {
 		// Commit: become the newest generation. Any still-in-flight review with an
 		// older gen will have its delivery suppressed.
 		const myGen = ++this.#generation;
-		const text = opts.extra ? `${this.#buildUpdate(true)}\n\n${opts.extra}` : this.#buildUpdate(true);
+		// Assemble the final advisor-facing text and redact ONCE at this choke
+		// point. The buffer was already redacted in #pushContext, but the `extra`
+		// paths bypass it entirely — `tool_result` injects `event.result` verbatim
+		// (tool stdout, file contents, API responses) and `input` injects the raw
+		// user prompt — so redacting the assembled text is what guarantees nothing
+		// unredacted ever reaches the advisor model. Project/global instructions
+		// (`.pi/advisor.md`) are user-authored guidance and intentionally NOT
+		// redacted.
+		const assembled = opts.extra ? `${this.#buildUpdate(true)}\n\n${opts.extra}` : this.#buildUpdate(true);
+		const { text } = redactSecrets(assembled);
 		const turn: PendingTurn = {
 			text,
 			modelRef: ref,

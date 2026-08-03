@@ -33,6 +33,7 @@ import {
 	ADVISOR_COMMAND_DESCRIPTION,
 	ADVISOR_TRIGGERS,
 	ADVISOR_TRIGGER_LABELS,
+	branchHasTaskStart,
 	formatModelRef,
 	MAX_CONTEXT_CHARS,
 	MIN_CONTEXT_CHARS,
@@ -112,6 +113,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// Pick up config changes made from another session/window.
 		Object.assign(config, readConfig());
+		// Arm-for-tasks: auto-enable when this session starts INSIDE a push-task
+		// leaf branch (pi restarted mid-task). Must run BEFORE rt.reset()/seedToLeaf
+		// so the seed covers the task branch (Blocker 1): the enable is a RUNTIME
+		// mutation only — the transient `enabled: true` is never persisted, so a
+		// main-session restart always resumes with the advisor off (Blocker 2).
+		if (config.armForTasks && branchHasTaskStart(ctx)) {
+			config.enabled = true; // in-memory only; file keeps enabled: false
+		}
 		// Re-prime: drop any in-flight review and clear the rolling context buffer
 		// so the advisor only reviews new turns going forward.
 		const rt = ensureRuntime(pi);
@@ -120,6 +129,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
+		// Arm-for-tasks fallback for sessions that missed session_start (a task
+		// started mid-session via pi-supergsd's push-task loop). Must run BEFORE
+		// the enabled check below: onTurnEnd early-returns when disabled, so
+		// enabling after it would lose the FIRST leaf turn AND the task prompt
+		// (which #captureNewUserMessages only reaches on an enabled turn — Blocker 1).
+		if (config.armForTasks && !config.enabled && branchHasTaskStart(ctx)) {
+			config.enabled = true; // in-memory only; file keeps enabled: false
+		}
 		if (!config.enabled || !config.advisorModel) return;
 		const rt = ensureRuntime(pi);
 		void rt.onTurnEnd(event.message, event.toolResults, ctx.sessionManager.getBranch(), {
@@ -218,6 +235,14 @@ export default function (pi: ExtensionAPI) {
 		runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 	});
 	pi.on("session_tree", async (_event, ctx) => {
+		// Leaving a task branch (e.g. `/finish-task` navigates back via
+		// ctx.navigateTree, or /abort-task): disable the advisor. In-memory only
+		// (Blocker 2) — the file already holds enabled: false while armed. The
+		// depth counter keeps the advisor enabled when finishing an INNER task
+		// while still inside the outer task.
+		if (config.enabled && config.armForTasks && !branchHasTaskStart(ctx)) {
+			config.enabled = false; // in-memory only
+		}
 		runtime?.reset();
 		runtime?.seedToLeaf(ctx.sessionManager.getBranch());
 	});
@@ -247,6 +272,8 @@ const ADVISOR_SUBCOMMANDS: { value: string; description: string }[] = [
 	{ value: "status", description: "Show config, triggers, instructions, and last review" },
 	{ value: "enable", description: "Enable the advisor" },
 	{ value: "disable", description: "Disable the advisor (keeps the model)" },
+	{ value: "arm", description: "Arm — auto-enable the advisor inside push-task leaf branches" },
+	{ value: "disarm", description: "Disarm — advisor stays off even inside push-task branches" },
 	{ value: "interrupting", description: "Toggle whether ALL advice interrupts (default: on)" },
 	{ value: "sync", description: "Wait for the advisor when it falls N turns behind (0-6)" },
 	{ value: "context", description: "Inspect or set the rolling transcript budget" },
@@ -376,6 +403,8 @@ async function handleAdvisorCommand(
 				"  /advisor status        Show config + last review",
 				"  /advisor enable        Enable the advisor",
 				"  /advisor disable       Disable the advisor (keeps the model)",
+				"  /advisor arm           Arm — auto-enable inside push-task leaf branches",
+				"  /advisor disarm        Disarm — stays off even inside tasks",
 				"  /advisor interrupting [on|off]  Toggle whether ALL advice interrupts (default: on)",
 			"  /advisor sync [0-6]          Wait for the advisor when it falls N turns behind",
 			"                                (0 = never wait, default; 1 = after every turn)",
@@ -418,6 +447,27 @@ async function handleAdvisorCommand(
 
 	if (sub === "disable") {
 		updateConfig(ctx, (c) => ({ ...c, enabled: false }), "Advisor disabled.");
+		return;
+	}
+
+	if (sub === "arm") {
+		// Lightweight in-place mutation + persist — deliberately NOT updateConfig,
+		// which resets+reseeds the runtime (wiping the rolling context buffer).
+		// Arm mid-leaf must never clear the advisor's context. `enabled` is forced
+		// to false explicitly (DEFAULT_CONFIG.enabled is true, and a persisted
+		// transient enable would leak into the main session on next start — Blocker 2).
+		config.armForTasks = true;
+		config.enabled = false;
+		writeConfig(config);
+		ctx.ui.notify("Advisor armed. Auto-enables in push-task leaf branches.", "info");
+		return;
+	}
+
+	if (sub === "disarm") {
+		config.armForTasks = false;
+		config.enabled = false;
+		writeConfig(config);
+		ctx.ui.notify("Advisor disarmed. Stays off even inside push-task branches.", "info");
 		return;
 	}
 
@@ -891,7 +941,11 @@ async function showPicker(ctx: ExtensionCommandContext): Promise<void> {
 
 function showStatus(ctx: ExtensionCommandContext): void {
 	const lines: string[] = [];
-	lines.push(`Advisor: ${config.enabled ? "enabled" : "disabled"}`);
+	// Three-state status: off (disabled, not armed) / armed (disabled, will
+	// auto-enable inside push-task leaf branches) / active (enabled now). Mirrors
+	// the ribbons fork's formatAdvisorStatus three-state logic.
+	const state = config.enabled ? "active" : config.armForTasks ? "armed" : "off";
+	lines.push(`Advisor: ${state}${config.armForTasks && !config.enabled ? " — will auto-enable inside push-task leaf branches" : ""}`);
 	lines.push(`Advisor model: ${config.advisorModel ?? "(none — pick one with /advisor)"}`);
 	lines.push(`Thinking: ${config.thinking ? `on (${config.thinkingLevel})` : "off"}`);
 	lines.push(`Triggers: ${config.triggers.join(", ")}`);

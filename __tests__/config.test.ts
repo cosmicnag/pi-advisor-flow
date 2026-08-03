@@ -87,6 +87,21 @@ describe("normalizeConfig", () => {
 		const c = normalizeConfig({ interrupting: "yes" as unknown as boolean });
 		expect(c.interrupting).toBe(true); // stays at default
 	});
+
+	it("armForTasks defaults to false (off unless explicitly armed)", () => {
+		expect(DEFAULT_CONFIG.armForTasks).toBe(false);
+		expect(normalizeConfig(null).armForTasks).toBe(false);
+	});
+
+	it("accepts an explicit armForTasks: true", () => {
+		const c = normalizeConfig({ armForTasks: true });
+		expect(c.armForTasks).toBe(true);
+	});
+
+	it("ignores a non-boolean armForTasks value", () => {
+		const c = normalizeConfig({ armForTasks: "yes" as unknown as boolean });
+		expect(c.armForTasks).toBe(false); // stays at default
+	});
 });
 
 describe("advisor context size", () => {
