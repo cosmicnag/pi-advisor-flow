@@ -279,30 +279,31 @@ export class AdvisorRuntime {
 			if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
 
 			// --- capture (always, independent of triggers) ---
-			console.log(`[pi-advisor-runtime] onTurnEnd: calling serializeTurn`);
+			const step = (s: string) => { try { appendFileSync("/tmp/pi-advisor-debug.log", s + "\n"); } catch {} };
+			step(`[pi-advisor-runtime] onTurnEnd: calling serializeTurn`);
 			const serialized = serializeTurn(message, toolResults);
-			console.log(`[pi-advisor-runtime] onTurnEnd: serializeTurn done, serialized=${!!serialized}`);
-			console.log(`[pi-advisor-runtime] onTurnEnd: calling captureNewUserMessages`);
+			step(`[pi-advisor-runtime] onTurnEnd: serializeTurn done, serialized=${!!serialized}`);
+			step(`[pi-advisor-runtime] onTurnEnd: calling captureNewUserMessages`);
 			this.#captureNewUserMessages(branch);
-			console.log(`[pi-advisor-runtime] onTurnEnd: captureNewUserMessages done`);
+			step(`[pi-advisor-runtime] onTurnEnd: captureNewUserMessages done`);
 			if (serialized) {
-				console.log(`[pi-advisor-runtime] onTurnEnd: calling pushContext`);
+				step(`[pi-advisor-runtime] onTurnEnd: calling pushContext`);
 				this.#pushContext(serialized);
-				console.log(`[pi-advisor-runtime] onTurnEnd: pushContext done`);
+				step(`[pi-advisor-runtime] onTurnEnd: pushContext done`);
 			}
 			// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
-			console.log(`[pi-advisor-runtime] onTurnEnd: calling armMidPause`);
+			step(`[pi-advisor-runtime] onTurnEnd: calling armMidPause`);
 			this.#armMidPause(ctx);
-			console.log(`[pi-advisor-runtime] onTurnEnd: armMidPause done`);
+			step(`[pi-advisor-runtime] onTurnEnd: armMidPause done`);
 
-			if (!serialized) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
+			if (!serialized) { step(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
 
 			// --- schedule (coalesced, trigger-gated) ---
 			const pendingError = this.#pendingToolError;
 			this.#pendingToolError = false;
 			const shouldReview = this.#has("turn_end") || (pendingError && this.#has("tool_error"));
-			if (!shouldReview) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !shouldReview (has_turn_end=${this.#has("turn_end")} pendingError=${pendingError} has_tool_error=${this.#has("tool_error")})`); return Promise.resolve(); }
-			console.log(`[pi-advisor-runtime] onTurnEnd: calling requestReview`);
+			if (!shouldReview) { step(`[pi-advisor-runtime] onTurnEnd: SKIP !shouldReview (has_turn_end=${this.#has("turn_end")} pendingError=${pendingError} has_tool_error=${this.#has("tool_error")})`); return Promise.resolve(); }
+			step(`[pi-advisor-runtime] onTurnEnd: calling requestReview`);
 			return this.requestReview({ source: pendingError && !this.#has("turn_end") ? "tool_error" : "turn_end", ctx });
 		} catch (err: any) {
 			const errLine = `[pi-advisor-runtime] onTurnEnd: ERROR ${err?.message ?? err}`;
