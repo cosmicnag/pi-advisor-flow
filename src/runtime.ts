@@ -277,22 +277,29 @@ export class AdvisorRuntime {
 		if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
 		if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
 
-		// --- capture (always, independent of triggers) ---
-		const serialized = serializeTurn(message, toolResults);
-		this.#captureNewUserMessages(branch);
-		if (serialized) this.#pushContext(serialized);
-		// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
-		this.#armMidPause(ctx);
+		try {
+			// --- capture (always, independent of triggers) ---
+			const serialized = serializeTurn(message, toolResults);
+			this.#captureNewUserMessages(branch);
+			if (serialized) this.#pushContext(serialized);
+			// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
+			this.#armMidPause(ctx);
 
-		if (!serialized) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
+			if (!serialized) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
 
-		// --- schedule (coalesced, trigger-gated) ---
-		const pendingError = this.#pendingToolError;
-		this.#pendingToolError = false;
-		const shouldReview = this.#has("turn_end") || (pendingError && this.#has("tool_error"));
-		if (!shouldReview) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !shouldReview (has_turn_end=${this.#has("turn_end")} pendingError=${pendingError} has_tool_error=${this.#has("tool_error")})`); return Promise.resolve(); }
-		console.log(`[pi-advisor-runtime] onTurnEnd: calling requestReview`);
-		return this.requestReview({ source: pendingError && !this.#has("turn_end") ? "tool_error" : "turn_end", ctx });
+			// --- schedule (coalesced, trigger-gated) ---
+			const pendingError = this.#pendingToolError;
+			this.#pendingToolError = false;
+			const shouldReview = this.#has("turn_end") || (pendingError && this.#has("tool_error"));
+			if (!shouldReview) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !shouldReview (has_turn_end=${this.#has("turn_end")} pendingError=${pendingError} has_tool_error=${this.#has("tool_error")})`); return Promise.resolve(); }
+			console.log(`[pi-advisor-runtime] onTurnEnd: calling requestReview`);
+			return this.requestReview({ source: pendingError && !this.#has("turn_end") ? "tool_error" : "turn_end", ctx });
+		} catch (err: any) {
+			const errLine = `[pi-advisor-runtime] onTurnEnd: ERROR ${err?.message ?? err}`;
+			console.log(errLine);
+			try { appendFileSync("/tmp/pi-advisor-debug.log", errLine + "\n"); } catch {}
+			return Promise.resolve();
+		}
 	}
 
 	/** `tool_execution_end` adapter. For any tool completion: arms/resets the
