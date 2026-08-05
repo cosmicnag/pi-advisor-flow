@@ -598,18 +598,18 @@ export class AdvisorRuntime {
 	async #drain(): Promise<AdvisorReviewResult | null> {
 		if (this.#busy) return null;
 		this.#busy = true;
-		console.log(`[pi-advisor-runtime] drain: START busy=true`);
+		log(`drain: START busy=true`);
 		try {
 			while (!this.disposed && this.#pending.length) {
 				const epoch = this.#epoch;
 				const batch = this.#pending.shift()!;
-				console.log(`[pi-advisor-runtime] drain: processing batch gen=${batch.gen} epoch=${epoch}`);
-				if (this.#epoch !== epoch) { console.log(`[pi-advisor-runtime] drain: SKIP epoch mismatch`); continue; }
+				log(`drain: processing batch gen=${batch.gen} epoch=${epoch}`);
+				if (this.#epoch !== epoch) { log(`drain: SKIP epoch mismatch`); continue; }
 
-				if (batch.signal.aborted) { console.log(`[pi-advisor-runtime] drain: SKIP aborted`); continue; }
+				if (batch.signal.aborted) { log(`drain: SKIP aborted`); continue; }
 
 				this.#lastReviewAt = Date.now();
-				console.log(`[pi-advisor-runtime] drain: calling #runOne`);
+				log(`drain: calling #runOne`);
 				const result = await this.#runOne(batch);
 				if (this.#epoch !== epoch) continue; // reset during review
 				// A newer trigger arrived while this call was in flight. Discard the
@@ -659,14 +659,22 @@ export class AdvisorRuntime {
 			}
 			return this.#lastResult;
 		} finally {
-			console.log(`[pi-advisor-runtime] drain: END busy=false`);
+			log(`drain: END busy=false`);
 			this.#busy = false;
 		}
 	}
 
 	async #runOne(turn: PendingTurn): Promise<AdvisorReviewResult> {
 		this.#lastAdvisorModel = turn.modelRef;
-		return this.#review(turn.text, turn.model, turn.auth, turn.cwd, turn.signal, this.#realDepsAdapter(turn));
+		log(`runOne: START model=${turn.modelRef}`);
+		try {
+			const result = await this.#review(turn.text, turn.model, turn.auth, turn.cwd, turn.signal, this.#realDepsAdapter(turn));
+			log(`runOne: DONE hasError=${!!result.error} hasAdvise=${!!result.advise}`);
+			return result;
+		} catch (err: any) {
+			log(`runOne: ERROR ${err?.message ?? err}`);
+			return { error: err?.message ?? String(err), advise: null };
+		}
 	}
 
 	/** Adapter that lets the injectable `review(text, ref)` test path drive the
