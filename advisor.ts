@@ -110,6 +110,7 @@ function ensureRuntime(pi: ExtensionAPI): AdvisorRuntime {
 
 export default function (pi: ExtensionAPI) {
 	config = readConfig();
+	(config as any)._id = Math.random().toString(36).slice(2); // unique marker for debugging
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Pick up config changes made from another session/window.
@@ -138,7 +139,7 @@ export default function (pi: ExtensionAPI) {
 		// enabling after it would lose the FIRST leaf turn AND the task prompt
 		// (which #captureNewUserMessages only reaches on an enabled turn — Blocker 1).
 		const hasTask = branchHasTaskStart(ctx);
-		const logLine = `[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask} model=${!!config.advisorModel}`;
+		const logLine = `[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask} model=${!!config.advisorModel} configId=${(config as any)._id}`;
 		console.log(logLine);
 		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
 		if (config.armForTasks && !config.enabled && hasTask) {

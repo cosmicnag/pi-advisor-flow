@@ -264,7 +264,7 @@ export class AdvisorRuntime {
 		branch: SessionEntry[],
 		ctx: ReviewCtx,
 	): Promise<void> {
-		const logLine = `[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel}`;
+		const logLine = `[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel} configId=${(this.config as any)._id}`;
 		console.log(logLine);
 		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
 		if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
