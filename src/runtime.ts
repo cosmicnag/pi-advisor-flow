@@ -409,7 +409,10 @@ export class AdvisorRuntime {
 	 *  most ONE entry (newer replaces older), so only the latest snapshot can
 	 *  ever be reviewed/delivered. */
 	async requestReview(opts: { source?: AdvisorTrigger; ctx: ReviewCtx; extra?: string; forceNonTriggering?: boolean }): Promise<void> {
-		if (this.disposed || !this.config.advisorModel) return;
+		if (this.disposed || !this.config.advisorModel) {
+			console.log(`[pi-advisor-runtime] requestReview: SKIPPED (disposed=${this.disposed} model=${!!this.config.advisorModel})`);
+			return;
+		}
 		// Snapshot the generation SYNCHRONOUSLY (before any await) so overlapping
 		// events resolving auth out of order can't let an older snapshot win. We do
 		// NOT bump it here: bumping before the cooldown early-return would
@@ -461,6 +464,7 @@ export class AdvisorRuntime {
 		// its delivery is not suppressed.
 		const now = Date.now();
 		if (this.config.cooldownMs > 0 && now - this.#lastReviewAt < this.config.cooldownMs) {
+			console.log(`[pi-advisor-runtime] requestReview: COOLDOWN (cooldownMs=${this.config.cooldownMs} lastReviewAt=${this.#lastReviewAt})`);
 			return;
 		}
 
@@ -492,6 +496,7 @@ export class AdvisorRuntime {
 		// one that hasn't drained yet.
 		if (this.#pending.length > 0) this.#pending[0] = turn;
 		else this.#pending.push(turn);
+		console.log(`[pi-advisor-runtime] requestReview: QUEUED gen=${myGen} pending=${this.#pending.length} source=${opts.source}`);
 		await this.#drain();
 	}
 
@@ -581,15 +586,18 @@ export class AdvisorRuntime {
 	async #drain(): Promise<AdvisorReviewResult | null> {
 		if (this.#busy) return null;
 		this.#busy = true;
+		console.log(`[pi-advisor-runtime] drain: START busy=true`);
 		try {
 			while (!this.disposed && this.#pending.length) {
 				const epoch = this.#epoch;
 				const batch = this.#pending.shift()!;
-				if (this.#epoch !== epoch) continue; // reset invalidated this batch
+				console.log(`[pi-advisor-runtime] drain: processing batch gen=${batch.gen} epoch=${epoch}`);
+				if (this.#epoch !== epoch) { console.log(`[pi-advisor-runtime] drain: SKIP epoch mismatch`); continue; }
 
-				if (batch.signal.aborted) continue;
+				if (batch.signal.aborted) { console.log(`[pi-advisor-runtime] drain: SKIP aborted`); continue; }
 
 				this.#lastReviewAt = Date.now();
+				console.log(`[pi-advisor-runtime] drain: calling #runOne`);
 				const result = await this.#runOne(batch);
 				if (this.#epoch !== epoch) continue; // reset during review
 				// A newer trigger arrived while this call was in flight. Discard the
@@ -639,6 +647,7 @@ export class AdvisorRuntime {
 			}
 			return this.#lastResult;
 		} finally {
+			console.log(`[pi-advisor-runtime] drain: END busy=false`);
 			this.#busy = false;
 		}
 	}
