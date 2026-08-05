@@ -263,8 +263,9 @@ export class AdvisorRuntime {
 		branch: SessionEntry[],
 		ctx: ReviewCtx,
 	): Promise<void> {
-		if (this.disposed) return Promise.resolve();
-		if (!this.config.enabled || !this.config.advisorModel) return Promise.resolve();
+		console.log(`[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel}`);
+		if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
+		if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
 
 		// --- capture (always, independent of triggers) ---
 		const serialized = serializeTurn(message, toolResults);
@@ -273,13 +274,14 @@ export class AdvisorRuntime {
 		// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
 		this.#armMidPause(ctx);
 
-		if (!serialized) return Promise.resolve();
+		if (!serialized) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
 
 		// --- schedule (coalesced, trigger-gated) ---
 		const pendingError = this.#pendingToolError;
 		this.#pendingToolError = false;
 		const shouldReview = this.#has("turn_end") || (pendingError && this.#has("tool_error"));
-		if (!shouldReview) return Promise.resolve();
+		if (!shouldReview) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !shouldReview (has_turn_end=${this.#has("turn_end")} pendingError=${pendingError} has_tool_error=${this.#has("tool_error")})`); return Promise.resolve(); }
+		console.log(`[pi-advisor-runtime] onTurnEnd: calling requestReview`);
 		return this.requestReview({ source: pendingError && !this.#has("turn_end") ? "tool_error" : "turn_end", ctx });
 	}
 
