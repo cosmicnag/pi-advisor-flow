@@ -52,11 +52,8 @@ import {
 
 /** Minimal slice of the pi API the runtime drives. */
 export interface AdvisorRuntimeHost {
-	/** Deliver one advisor note batch into the primary session.
-	 *  `forceNonTriggering` (set for `agent_settled`-triggered reviews) suppresses
-	 *  `triggerTurn` regardless of severity, so a settled review can never start
-	 *  another agent run and re-trigger `agent_settled` (review→advice→run loop). */
-	sendAdvice(notes: AdvisorNote[], model: string, opts?: { forceNonTriggering?: boolean }): Promise<void>;
+	/** Deliver one advisor note batch into the primary session. */
+	sendAdvice(notes: AdvisorNote[], model: string): Promise<void>;
 }
 
 /** Context the runtime needs to resolve the advisor model/auth and run a
@@ -79,9 +76,6 @@ interface RequestOpts {
 	/** Extra text appended to the snapshot (e.g. the just-completed tool for
 	 *  `tool_result`, or the new prompt for `input`). */
 	extra?: string;
-	/** When true, delivery never sets `triggerTurn` — used by `agent_settled`
-	 *  to break the review→advice→run→settled loop. */
-	forceNonTriggering?: boolean;
 }
 
 /** One queued turn to review. Captures the per-turn context (B3) and the
@@ -106,8 +100,6 @@ interface PendingTurn {
 	 *  is no longer current by the time its review returns is suppressed (a newer
 	 *  snapshot superseded it) and never delivered. */
 	gen: number;
-	/** Set for `agent_settled` reviews so delivery omits `triggerTurn`. */
-	forceNonTriggering?: boolean;
 }
 
 export class AdvisorRuntime {
@@ -320,15 +312,19 @@ export class AdvisorRuntime {
 	}
 
 	/** `agent_settled` adapter: fires once per agent run, after the whole
-	 *  tool/turn loop with no automatic continuation. Delivers non-triggering
-	 *  (`forceNonTriggering`) so the review can never start another run and
-	 *  re-fire `agent_settled` (review→advice→run→settled loop). The `mid_pause`
-	 *  timer is cancelled since the run is over. */
+	 *  tool/turn loop with no automatic continuation. Delivers with normal
+	 *  severity-based triggering so the FINAL advice (which lands after the
+	 *  main model's terminal turn, when it is idle) actually reaches the model:
+	 *  a non-triggering delivery would just be appended to state and never
+	 *  prompt a reaction. The loop this once guarded against is already bounded
+	 *  by the advisor's silence discipline, the `#recentKeys` dedupe, and the
+	 *  `cooldownMs` knob. The `mid_pause` timer is cancelled since the run is
+	 *  over. */
 	onAgentSettled(ctx: ReviewCtx): Promise<void> {
 		if (this.disposed || !this.config.enabled || !this.config.advisorModel) return Promise.resolve();
 		this.#cancelMidPause();
 		if (!this.#has("agent_settled")) return Promise.resolve();
-		return this.requestReview({ source: "agent_settled", ctx, forceNonTriggering: true });
+		return this.requestReview({ source: "agent_settled", ctx });
 	}
 
 	/** `input` adapter. ALWAYS delimits a goal (arms/cancels `mid_pause`) so the
@@ -421,7 +417,7 @@ export class AdvisorRuntime {
 	 *  this request if a newer one has superseded it. The pending queue holds at
 	 *  most ONE entry (newer replaces older), so only the latest snapshot can
 	 *  ever be reviewed/delivered. */
-	async requestReview(opts: { source?: AdvisorTrigger; ctx: ReviewCtx; extra?: string; forceNonTriggering?: boolean }): Promise<void> {
+	async requestReview(opts: { source?: AdvisorTrigger; ctx: ReviewCtx; extra?: string }): Promise<void> {
 		try {
 			if (this.disposed || !this.config.advisorModel) {
 				return;
@@ -502,7 +498,6 @@ export class AdvisorRuntime {
 			projectInstructions: ctx.projectInstructions,
 			signal: this.#adoptSignal(ctx.signal),
 			gen: myGen,
-			forceNonTriggering: opts.forceNonTriggering,
 		};
 		// Latest-wins: keep at most one pending; a newer request replaces an older
 		// one that hasn't drained yet.
@@ -654,7 +649,6 @@ export class AdvisorRuntime {
 						await this.host.sendAdvice(
 							[note],
 							this.#lastAdvisorModel ?? this.config.advisorModel ?? "",
-							{ forceNonTriggering: batch.forceNonTriggering },
 						);
 					}
 				}
@@ -756,15 +750,10 @@ export function makeHost(
 	getInterrupting: () => boolean = () => false,
 ): Pick<AdvisorRuntimeHost, "sendAdvice"> {
 	return {
-		sendAdvice: async (notes, model, opts) => {
+		sendAdvice: async (notes, model) => {
 			const content = formatAdvisorBatchContent(notes);
 			const details: AdvisorMessageDetails = { notes, model };
-			// `forceNonTriggering` (agent_settled reviews) suppresses triggerTurn
-			// regardless of severity, breaking the review→advice→run→settled loop.
-			const base = deliveryOptions(notes[0]?.severity, getInterrupting());
-			const deliverOpts = opts?.forceNonTriggering
-				? { deliverAs: base.deliverAs as "steer" }
-				: base;
+			const deliverOpts = deliveryOptions(notes[0]?.severity, getInterrupting());
 			await pi.sendMessage(
 				{
 					customType: ADVISOR_CUSTOM_TYPE,

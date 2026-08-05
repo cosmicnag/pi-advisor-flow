@@ -99,7 +99,7 @@ function makeRuntime(
 	branch: SessionEntry[] = [],
 	config: Partial<{ maxRetries: number; contextChars: number; advisorModel: string | null; enabled: boolean; cooldownMs: number; syncLag: number; triggers: AdvisorTrigger[]; midPauseMs: number; armForTasks: boolean }> = {},
 ) {
-	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string, _opts?: { forceNonTriggering?: boolean }) => {});
+	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string) => {});
 	const host = { sendAdvice };
 	const rt = new AdvisorRuntime(
 		host as never,
@@ -568,8 +568,9 @@ describe("AdvisorRuntime — selectable triggers", () => {
 		await settle(rt);
 		expect(calls.length).toBe(1);
 		expect(sendAdvice).toHaveBeenCalledTimes(1);
-		// Loop-break: settled delivery MUST pass forceNonTriggering:true.
-		expect(sendAdvice.mock.calls[0][2]).toEqual({ forceNonTriggering: true });
+		// Final advice must reach the idle model: severity-based triggering (no
+		// forceNonTriggering), so a terminal-turn delivery prompts a reaction.
+		expect(sendAdvice.mock.calls[0]).toHaveLength(2);
 	});
 
 	it("agent_settled loop regression: a settled review never re-triggers a recursive chain", async () => {

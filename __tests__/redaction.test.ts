@@ -120,7 +120,7 @@ function makeRuntime(
 	review: ReviewFn,
 	config: Partial<{ enabled: boolean; advisorModel: string | null; contextChars: number; triggers: AdvisorTrigger[]; armForTasks: boolean }> = {},
 ) {
-	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string, _opts?: { forceNonTriggering?: boolean }) => {});
+	const sendAdvice = vi.fn(async (_notes: AdvisorNote[], _model: string) => {});
 	const host = { sendAdvice };
 	const rt = new AdvisorRuntime(
 		host as never,

@@ -197,13 +197,15 @@ cancel. Changes persist to the global config.
 | `turn_end` | After every turn (default) |
 | `tool_error` | After a turn that contained a tool error, deferred to `turn_end` (default) |
 | `tool_result` | After each tool completes |
-| `agent_settled` | Once when the whole run settles (no auto-continuation) — delivered non-interrupting |
+| `agent_settled` | Once when the whole run settles (no auto-continuation) — the final advice reaches the idle model via severity-based triggering |
 | `mid_pause` | After a quiet period mid-run (debounced; at most once per input) |
 | `input` | On user input — a prompt/intent review before the agent acts |
 
 `agent_settled` is the robust choice for "review once when done, not every
-turn": it fires a single non-triggering review per run, so advice can't blast
-one-by-one after completion. `mid_pause` is opt-in early-warning on genuine
+turn": it fires a single review per run, and the delivery still uses normal
+severity-based triggering so the main model reacts to the final advice even
+when idle (a non-triggering delivery would only be appended, never prompting
+a reaction). `mid_pause` is opt-in early-warning on genuine
 mid-run inactivity; a fluid run that never pauses fires nothing from it.
 
 ## Commands
