@@ -30,6 +30,7 @@
  *   to the retry backoff, so abort/shutdown cancels in-flight work.
  */
 
+import { appendFileSync } from "node:fs";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -263,7 +264,9 @@ export class AdvisorRuntime {
 		branch: SessionEntry[],
 		ctx: ReviewCtx,
 	): Promise<void> {
-		console.log(`[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel}`);
+		const logLine = `[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel}`;
+		console.log(logLine);
+		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
 		if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
 		if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
 
