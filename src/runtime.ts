@@ -271,13 +271,13 @@ export class AdvisorRuntime {
 		branch: SessionEntry[],
 		ctx: ReviewCtx,
 	): Promise<void> {
-		const logLine = `[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel} configId=${(this.config as any)._id}`;
-		console.log(logLine);
-		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
-		if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
-		if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
-
 		try {
+			const logLine = `[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel} configId=${(this.config as any)._id}`;
+			console.log(logLine);
+			try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
+			if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
+			if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
+
 			// --- capture (always, independent of triggers) ---
 			const serialized = serializeTurn(message, toolResults);
 			this.#captureNewUserMessages(branch);
