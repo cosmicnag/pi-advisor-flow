@@ -122,6 +122,12 @@ export class AdvisorRuntime {
 	#epoch = 0;
 	disposed = false;
 
+	/** Debug logger: mirrors to console AND the debug log file. */
+	static log(msg: string) {
+		console.log(`[pi-advisor-runtime] ${msg}`);
+		try { appendFileSync("/tmp/pi-advisor-debug.log", `[pi-advisor-runtime] ${msg}\n`); } catch {}
+	}
+
 	/** Rolling buffer of recent per-turn deltas, bounded by `contextChars`.
 	 *  Replaces oh-my-pi's own append-only advisor context (which the extension
 	 *  API can't reach) with a cheap char-bounded approximation. */
@@ -439,10 +445,11 @@ export class AdvisorRuntime {
 	 *  most ONE entry (newer replaces older), so only the latest snapshot can
 	 *  ever be reviewed/delivered. */
 	async requestReview(opts: { source?: AdvisorTrigger; ctx: ReviewCtx; extra?: string; forceNonTriggering?: boolean }): Promise<void> {
-		if (this.disposed || !this.config.advisorModel) {
-			console.log(`[pi-advisor-runtime] requestReview: SKIPPED (disposed=${this.disposed} model=${!!this.config.advisorModel})`);
-			return;
-		}
+		try {
+			if (this.disposed || !this.config.advisorModel) {
+				console.log(`[pi-advisor-runtime] requestReview: SKIPPED (disposed=${this.disposed} model=${!!this.config.advisorModel})`);
+				return;
+			}
 		// Snapshot the generation SYNCHRONOUSLY (before any await) so overlapping
 		// events resolving auth out of order can't let an older snapshot win. We do
 		// NOT bump it here: bumping before the cooldown early-return would
@@ -528,6 +535,11 @@ export class AdvisorRuntime {
 		else this.#pending.push(turn);
 		console.log(`[pi-advisor-runtime] requestReview: QUEUED gen=${myGen} pending=${this.#pending.length} source=${opts.source}`);
 		await this.#drain();
+		} catch (err: any) {
+			const errLine = `[pi-advisor-runtime] requestReview: ERROR ${err?.message ?? err}`;
+			console.log(errLine);
+			try { appendFileSync("/tmp/pi-advisor-debug.log", errLine + "\n"); } catch {}
+		}
 	}
 
 	/** Shared lifecycle controller — aborted by reset/dispose/compact/tree-nav
@@ -616,18 +628,18 @@ export class AdvisorRuntime {
 	async #drain(): Promise<AdvisorReviewResult | null> {
 		if (this.#busy) return null;
 		this.#busy = true;
-		log(`drain: START busy=true`);
+AdvisorRuntime.log(`drain: START busy=true`);
 		try {
 			while (!this.disposed && this.#pending.length) {
 				const epoch = this.#epoch;
 				const batch = this.#pending.shift()!;
-				log(`drain: processing batch gen=${batch.gen} epoch=${epoch}`);
-				if (this.#epoch !== epoch) { log(`drain: SKIP epoch mismatch`); continue; }
+				AdvisorRuntime.log(`drain: processing batch gen=${batch.gen} epoch=${epoch}`);
+				if (this.#epoch !== epoch) { AdvisorRuntime.log(`drain: SKIP epoch mismatch`); continue; }
 
-				if (batch.signal.aborted) { log(`drain: SKIP aborted`); continue; }
+				if (batch.signal.aborted) { AdvisorRuntime.log(`drain: SKIP aborted`); continue; }
 
 				this.#lastReviewAt = Date.now();
-				log(`drain: calling #runOne`);
+				AdvisorRuntime.log(`drain: calling #runOne`);
 				const result = await this.#runOne(batch);
 				if (this.#epoch !== epoch) continue; // reset during review
 				// A newer trigger arrived while this call was in flight. Discard the
@@ -677,21 +689,21 @@ export class AdvisorRuntime {
 			}
 			return this.#lastResult;
 		} finally {
-			log(`drain: END busy=false`);
+AdvisorRuntime.log(`drain: END busy=false`);
 			this.#busy = false;
 		}
 	}
 
 	async #runOne(turn: PendingTurn): Promise<AdvisorReviewResult> {
 		this.#lastAdvisorModel = turn.modelRef;
-		log(`runOne: START model=${turn.modelRef}`);
+AdvisorRuntime.log(`runOne: START model=${turn.modelRef}`);
 		try {
 			const result = await this.#review(turn.text, turn.model, turn.auth, turn.cwd, turn.signal, this.#realDepsAdapter(turn));
-			log(`runOne: DONE hasError=${!!result.error} hasAdvise=${!!result.advise}`);
+AdvisorRuntime.log(`runOne: DONE hasError=${!!result.error} hasAdvise=${!!result.advise}`);
 			return result;
 		} catch (err: any) {
-			log(`runOne: ERROR ${err?.message ?? err}`);
-			return { error: err?.message ?? String(err), advise: null };
+AdvisorRuntime.log(`runOne: ERROR ${err?.message ?? err}`);
+			return { error: err?.message ?? String(err), advise: null, rounds: 0 };
 		}
 	}
 

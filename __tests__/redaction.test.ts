@@ -124,7 +124,7 @@ function makeRuntime(
 	const host = { sendAdvice };
 	const rt = new AdvisorRuntime(
 		host as never,
-		{
+		() => ({
 			enabled: config.enabled ?? true,
 			armForTasks: config.armForTasks ?? false,
 			advisorModel: config.advisorModel === undefined ? "fake/fake" : config.advisorModel,
@@ -139,7 +139,7 @@ function makeRuntime(
 			triggers: config.triggers ?? ["turn_end", "tool_error"],
 			midPauseMs: 4000,
 			instructionsMode: "project",
-		},
+		}),
 		review as never,
 	);
 	const ctx = {

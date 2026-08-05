@@ -164,6 +164,10 @@ export default function (pi: ExtensionAPI) {
 			modelRegistry: ctx.modelRegistry,
 			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
 			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
+		}).catch((err) => {
+			const errLine = `[pi-advisor] turn_end: onTurnEnd REJECTED: ${err?.message ?? err}`;
+			console.log(errLine);
+			try { appendFileSync("/tmp/pi-advisor-debug.log", errLine + "\n"); } catch {}
 		});
 	});
 
