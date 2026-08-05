@@ -30,7 +30,6 @@
  *   to the retry backoff, so abort/shutdown cancels in-flight work.
  */
 
-import { appendFileSync } from "node:fs";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -121,12 +120,6 @@ export class AdvisorRuntime {
 	 *  instead of being retried into the post-reset conversation. */
 	#epoch = 0;
 	disposed = false;
-
-	/** Debug logger: mirrors to console AND the debug log file. */
-	static log(msg: string) {
-		console.log(`[pi-advisor-runtime] ${msg}`);
-		try { appendFileSync("/tmp/pi-advisor-debug.log", `[pi-advisor-runtime] ${msg}\n`); } catch {}
-	}
 
 	/** Rolling buffer of recent per-turn deltas, bounded by `contextChars`.
 	 *  Replaces oh-my-pi's own append-only advisor context (which the extension
@@ -278,43 +271,27 @@ export class AdvisorRuntime {
 		ctx: ReviewCtx,
 	): Promise<void> {
 		try {
-			const logLine = `[pi-advisor-runtime] onTurnEnd: disposed=${this.disposed} enabled=${this.config.enabled} model=${!!this.config.advisorModel} configId=${(this.config as any)._id}`;
-			console.log(logLine);
-			try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
-			if (this.disposed) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP disposed`); return Promise.resolve(); }
-			if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
+			if (this.disposed) return Promise.resolve();
+			if (!this.config.enabled || !this.config.advisorModel) return Promise.resolve();
 
 			// --- capture (always, independent of triggers) ---
-			const step = (s: string) => { try { appendFileSync("/tmp/pi-advisor-debug.log", s + "\n"); } catch {} };
-			step(`[pi-advisor-runtime] onTurnEnd: calling serializeTurn`);
 			const serialized = serializeTurn(message, toolResults);
-			step(`[pi-advisor-runtime] onTurnEnd: serializeTurn done, serialized=${!!serialized}`);
-			step(`[pi-advisor-runtime] onTurnEnd: calling captureNewUserMessages`);
 			this.#captureNewUserMessages(branch);
-			step(`[pi-advisor-runtime] onTurnEnd: captureNewUserMessages done`);
-			if (serialized) {
-				step(`[pi-advisor-runtime] onTurnEnd: calling pushContext`);
-				this.#pushContext(serialized);
-				step(`[pi-advisor-runtime] onTurnEnd: pushContext done`);
-			}
+			if (serialized) this.#pushContext(serialized);
 			// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
-			step(`[pi-advisor-runtime] onTurnEnd: calling armMidPause`);
 			this.#armMidPause(ctx);
-			step(`[pi-advisor-runtime] onTurnEnd: armMidPause done`);
 
-			if (!serialized) { step(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
+			if (!serialized) return Promise.resolve();
 
 			// --- schedule (coalesced, trigger-gated) ---
 			const pendingError = this.#pendingToolError;
 			this.#pendingToolError = false;
 			const shouldReview = this.#has("turn_end") || (pendingError && this.#has("tool_error"));
-			if (!shouldReview) { step(`[pi-advisor-runtime] onTurnEnd: SKIP !shouldReview (has_turn_end=${this.#has("turn_end")} pendingError=${pendingError} has_tool_error=${this.#has("tool_error")})`); return Promise.resolve(); }
-			step(`[pi-advisor-runtime] onTurnEnd: calling requestReview`);
+			if (!shouldReview) return Promise.resolve();
 			return this.requestReview({ source: pendingError && !this.#has("turn_end") ? "tool_error" : "turn_end", ctx });
 		} catch (err: any) {
-			const errLine = `[pi-advisor-runtime] onTurnEnd: ERROR ${err?.message ?? err}`;
-			console.log(errLine);
-			try { appendFileSync("/tmp/pi-advisor-debug.log", errLine + "\n"); } catch {}
+			// Fire-and-forget guard: a synchronous throw here must never crash pi.
+			console.error(`[pi-advisor-runtime] onTurnEnd error:`, err);
 			return Promise.resolve();
 		}
 	}
@@ -447,7 +424,6 @@ export class AdvisorRuntime {
 	async requestReview(opts: { source?: AdvisorTrigger; ctx: ReviewCtx; extra?: string; forceNonTriggering?: boolean }): Promise<void> {
 		try {
 			if (this.disposed || !this.config.advisorModel) {
-				console.log(`[pi-advisor-runtime] requestReview: SKIPPED (disposed=${this.disposed} model=${!!this.config.advisorModel})`);
 				return;
 			}
 		// Snapshot the generation SYNCHRONOUSLY (before any await) so overlapping
@@ -501,7 +477,6 @@ export class AdvisorRuntime {
 		// its delivery is not suppressed.
 		const now = Date.now();
 		if (this.config.cooldownMs > 0 && now - this.#lastReviewAt < this.config.cooldownMs) {
-			console.log(`[pi-advisor-runtime] requestReview: COOLDOWN (cooldownMs=${this.config.cooldownMs} lastReviewAt=${this.#lastReviewAt})`);
 			return;
 		}
 
@@ -533,12 +508,12 @@ export class AdvisorRuntime {
 		// one that hasn't drained yet.
 		if (this.#pending.length > 0) this.#pending[0] = turn;
 		else this.#pending.push(turn);
-		console.log(`[pi-advisor-runtime] requestReview: QUEUED gen=${myGen} pending=${this.#pending.length} source=${opts.source}`);
 		await this.#drain();
 		} catch (err: any) {
-			const errLine = `[pi-advisor-runtime] requestReview: ERROR ${err?.message ?? err}`;
-			console.log(errLine);
-			try { appendFileSync("/tmp/pi-advisor-debug.log", errLine + "\n"); } catch {}
+			// Fire-and-forget guard: requestReview must never reject (the caller
+			// void's the promise). Record the failure in status instead.
+			this.#lastResult = { advise: null, rounds: 0, error: err instanceof Error ? err.message : String(err) };
+			console.error(`[pi-advisor-runtime] requestReview error:`, err);
 		}
 	}
 
@@ -628,18 +603,15 @@ export class AdvisorRuntime {
 	async #drain(): Promise<AdvisorReviewResult | null> {
 		if (this.#busy) return null;
 		this.#busy = true;
-AdvisorRuntime.log(`drain: START busy=true`);
 		try {
 			while (!this.disposed && this.#pending.length) {
 				const epoch = this.#epoch;
 				const batch = this.#pending.shift()!;
-				AdvisorRuntime.log(`drain: processing batch gen=${batch.gen} epoch=${epoch}`);
-				if (this.#epoch !== epoch) { AdvisorRuntime.log(`drain: SKIP epoch mismatch`); continue; }
+				if (this.#epoch !== epoch) continue;
 
-				if (batch.signal.aborted) { AdvisorRuntime.log(`drain: SKIP aborted`); continue; }
+				if (batch.signal.aborted) continue;
 
 				this.#lastReviewAt = Date.now();
-				AdvisorRuntime.log(`drain: calling #runOne`);
 				const result = await this.#runOne(batch);
 				if (this.#epoch !== epoch) continue; // reset during review
 				// A newer trigger arrived while this call was in flight. Discard the
@@ -689,20 +661,16 @@ AdvisorRuntime.log(`drain: START busy=true`);
 			}
 			return this.#lastResult;
 		} finally {
-AdvisorRuntime.log(`drain: END busy=false`);
 			this.#busy = false;
 		}
 	}
 
 	async #runOne(turn: PendingTurn): Promise<AdvisorReviewResult> {
 		this.#lastAdvisorModel = turn.modelRef;
-AdvisorRuntime.log(`runOne: START model=${turn.modelRef}`);
 		try {
 			const result = await this.#review(turn.text, turn.model, turn.auth, turn.cwd, turn.signal, this.#realDepsAdapter(turn));
-AdvisorRuntime.log(`runOne: DONE hasError=${!!result.error} hasAdvise=${!!result.advise}`);
 			return result;
 		} catch (err: any) {
-AdvisorRuntime.log(`runOne: ERROR ${err?.message ?? err}`);
 			return { error: err?.message ?? String(err), advise: null, rounds: 0 };
 		}
 	}

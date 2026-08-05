@@ -426,7 +426,6 @@ export function branchHasTaskStart(ctx: ExtensionContext): boolean {
 		if (entry.type === "custom" && entry.customType === "task-start") depth++;
 		if (entry.type === "custom" && entry.customType === "task-done") depth = Math.max(0, depth - 1);
 	}
-	console.log(`[pi-advisor] branchHasTaskStart: branchLen=${branch.length} depth=${depth}`);
 	return depth > 0;
 }
 

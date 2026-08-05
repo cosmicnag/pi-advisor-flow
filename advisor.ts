@@ -23,7 +23,6 @@
  * Install: `pi install https://github.com/hazrid93/pi-advisor` then `/reload`.
  */
 
-import { appendFileSync } from "node:fs";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -110,12 +109,10 @@ function ensureRuntime(pi: ExtensionAPI): AdvisorRuntime {
 
 export default function (pi: ExtensionAPI) {
 	config = readConfig();
-	(config as any)._id = Math.random().toString(36).slice(2); // unique marker for debugging
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Pick up config changes made from another session/window.
 		Object.assign(config, readConfig());
-		console.log(`[pi-advisor] session_start: armForTasks=${config.armForTasks} enabled=${config.enabled}`);
 		// Arm-for-tasks: auto-enable when this session starts INSIDE a push-task
 		// leaf branch (pi restarted mid-task). Must run BEFORE rt.reset()/seedToLeaf
 		// so the seed covers the task branch (Blocker 1): the enable is a RUNTIME
@@ -123,7 +120,6 @@ export default function (pi: ExtensionAPI) {
 		// main-session restart always resumes with the advisor off (Blocker 2).
 		if (config.armForTasks && branchHasTaskStart(ctx)) {
 			config.enabled = true; // in-memory only; file keeps enabled: false
-			console.log(`[pi-advisor] session_start: ARMED via branchHasTaskStart`);
 		}
 		// Re-prime: drop any in-flight review and clear the rolling context buffer
 		// so the advisor only reviews new turns going forward.
@@ -138,26 +134,11 @@ export default function (pi: ExtensionAPI) {
 		// the enabled check below: onTurnEnd early-returns when disabled, so
 		// enabling after it would lose the FIRST leaf turn AND the task prompt
 		// (which #captureNewUserMessages only reaches on an enabled turn — Blocker 1).
-		const hasTask = branchHasTaskStart(ctx);
-		const logLine = `[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask} model=${!!config.advisorModel} configId=${(config as any)._id}`;
-		console.log(logLine);
-		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
-		if (config.armForTasks && !config.enabled && hasTask) {
+		if (config.armForTasks && !config.enabled && branchHasTaskStart(ctx)) {
 			config.enabled = true; // in-memory only; file keeps enabled: false
-			console.log(`[pi-advisor] armForTasks ENABLED`);
 		}
-		if (!config.enabled) {
-			console.log(`[pi-advisor] turn_end: SKIPPED (not enabled)`);
-			return;
-		}
-		if (!config.advisorModel) {
-			console.log(`[pi-advisor] turn_end: SKIPPED (no model)`);
-			return;
-		}
+		if (!config.enabled || !config.advisorModel) return;
 		const rt = ensureRuntime(pi);
-		const logLine2 = `[pi-advisor] turn_end: calling rt.onTurnEnd, runtime busy=${rt.isBusy}`;
-		console.log(logLine2);
-		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine2 + "\n"); } catch {}
 		void rt.onTurnEnd(event.message, event.toolResults, ctx.sessionManager.getBranch(), {
 			signal: ctx.signal,
 			cwd: ctx.cwd,
@@ -165,9 +146,8 @@ export default function (pi: ExtensionAPI) {
 			getApiKeyAndHeaders: (m) => ctx.modelRegistry.getApiKeyAndHeaders(m),
 			projectInstructions: activeInstructions(ctx.cwd, ctx.isProjectTrusted()),
 		}).catch((err) => {
-			const errLine = `[pi-advisor] turn_end: onTurnEnd REJECTED: ${err?.message ?? err}`;
-			console.log(errLine);
-			try { appendFileSync("/tmp/pi-advisor-debug.log", errLine + "\n"); } catch {}
+			// Fire-and-forget guard: onTurnEnd must never crash pi on a rejection.
+			console.error(`[pi-advisor] onTurnEnd rejected:`, err);
 		});
 	});
 
