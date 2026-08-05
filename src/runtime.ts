@@ -279,11 +279,21 @@ export class AdvisorRuntime {
 			if (!this.config.enabled || !this.config.advisorModel) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !enabled||!model`); return Promise.resolve(); }
 
 			// --- capture (always, independent of triggers) ---
+			console.log(`[pi-advisor-runtime] onTurnEnd: calling serializeTurn`);
 			const serialized = serializeTurn(message, toolResults);
+			console.log(`[pi-advisor-runtime] onTurnEnd: serializeTurn done, serialized=${!!serialized}`);
+			console.log(`[pi-advisor-runtime] onTurnEnd: calling captureNewUserMessages`);
 			this.#captureNewUserMessages(branch);
-			if (serialized) this.#pushContext(serialized);
+			console.log(`[pi-advisor-runtime] onTurnEnd: captureNewUserMessages done`);
+			if (serialized) {
+				console.log(`[pi-advisor-runtime] onTurnEnd: calling pushContext`);
+				this.#pushContext(serialized);
+				console.log(`[pi-advisor-runtime] onTurnEnd: pushContext done`);
+			}
 			// Activity boundary: re-arm the mid_pause debounce for the next quiet period.
+			console.log(`[pi-advisor-runtime] onTurnEnd: calling armMidPause`);
 			this.#armMidPause(ctx);
+			console.log(`[pi-advisor-runtime] onTurnEnd: armMidPause done`);
 
 			if (!serialized) { console.log(`[pi-advisor-runtime] onTurnEnd: SKIP !serialized`); return Promise.resolve(); }
 
