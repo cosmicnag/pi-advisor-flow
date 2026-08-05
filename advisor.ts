@@ -113,6 +113,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// Pick up config changes made from another session/window.
 		Object.assign(config, readConfig());
+		console.log(`[pi-advisor] session_start: armForTasks=${config.armForTasks} enabled=${config.enabled}`);
 		// Arm-for-tasks: auto-enable when this session starts INSIDE a push-task
 		// leaf branch (pi restarted mid-task). Must run BEFORE rt.reset()/seedToLeaf
 		// so the seed covers the task branch (Blocker 1): the enable is a RUNTIME
@@ -120,6 +121,7 @@ export default function (pi: ExtensionAPI) {
 		// main-session restart always resumes with the advisor off (Blocker 2).
 		if (config.armForTasks && branchHasTaskStart(ctx)) {
 			config.enabled = true; // in-memory only; file keeps enabled: false
+			console.log(`[pi-advisor] session_start: ARMED via branchHasTaskStart`);
 		}
 		// Re-prime: drop any in-flight review and clear the rolling context buffer
 		// so the advisor only reviews new turns going forward.
