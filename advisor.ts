@@ -134,8 +134,12 @@ export default function (pi: ExtensionAPI) {
 		// the enabled check below: onTurnEnd early-returns when disabled, so
 		// enabling after it would lose the FIRST leaf turn AND the task prompt
 		// (which #captureNewUserMessages only reaches on an enabled turn — Blocker 1).
-		if (config.armForTasks && !config.enabled && branchHasTaskStart(ctx)) {
+		const hasTask = branchHasTaskStart(ctx);
+		if (config.armForTasks && !config.enabled && hasTask) {
 			config.enabled = true; // in-memory only; file keeps enabled: false
+			console.log(`[pi-advisor] armForTasks ENABLED: armForTasks=${config.armForTasks} hasTask=${hasTask}`);
+		} else if (config.armForTasks) {
+			console.log(`[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask}`);
 		}
 		if (!config.enabled || !config.advisorModel) return;
 		const rt = ensureRuntime(pi);
