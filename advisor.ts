@@ -104,7 +104,7 @@ function buildHost(pi: ExtensionAPI): AdvisorRuntimeHost {
 /** Lazily create the runtime on first use (turn_end or command). */
 function ensureRuntime(pi: ExtensionAPI): AdvisorRuntime {
 	if (runtime && !runtime.disposed) return runtime;
-	runtime = new AdvisorRuntime(buildHost(pi), config);
+	runtime = new AdvisorRuntime(buildHost(pi), () => config);
 	return runtime;
 }
 

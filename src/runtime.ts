@@ -179,7 +179,7 @@ export class AdvisorRuntime {
 
 	constructor(
 		private readonly host: AdvisorRuntimeHost,
-		private readonly config: AdvisorConfig,
+		private readonly getConfig: () => AdvisorConfig,
 		review?: (
 			sessionUpdate: string,
 			model: Model<Api>,
@@ -190,6 +190,13 @@ export class AdvisorRuntime {
 		) => Promise<AdvisorReviewResult>,
 	) {
 		this.#review = review ?? ((text, model, auth, cwd, signal, cfg) => runAdvisorReview(text, model, auth, cwd, signal, cfg));
+	}
+
+		/** Dynamic config accessor — always returns the current config from the
+	 *  getter, so in-memory mutations (armForTasks transient enable) are visible
+	 *  even if the runtime was created before the mutation. */
+	get config(): AdvisorConfig {
+		return this.getConfig();
 	}
 
 	get isBusy(): boolean {
