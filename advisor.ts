@@ -137,14 +137,21 @@ export default function (pi: ExtensionAPI) {
 		// enabling after it would lose the FIRST leaf turn AND the task prompt
 		// (which #captureNewUserMessages only reaches on an enabled turn — Blocker 1).
 		const hasTask = branchHasTaskStart(ctx);
+		console.log(`[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask} model=${!!config.advisorModel}`);
 		if (config.armForTasks && !config.enabled && hasTask) {
 			config.enabled = true; // in-memory only; file keeps enabled: false
-			console.log(`[pi-advisor] armForTasks ENABLED: armForTasks=${config.armForTasks} hasTask=${hasTask}`);
-		} else if (config.armForTasks) {
-			console.log(`[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask}`);
+			console.log(`[pi-advisor] armForTasks ENABLED`);
 		}
-		if (!config.enabled || !config.advisorModel) return;
+		if (!config.enabled) {
+			console.log(`[pi-advisor] turn_end: SKIPPED (not enabled)`);
+			return;
+		}
+		if (!config.advisorModel) {
+			console.log(`[pi-advisor] turn_end: SKIPPED (no model)`);
+			return;
+		}
 		const rt = ensureRuntime(pi);
+		console.log(`[pi-advisor] turn_end: calling rt.onTurnEnd, runtime busy=${rt.isBusy}`);
 		void rt.onTurnEnd(event.message, event.toolResults, ctx.sessionManager.getBranch(), {
 			signal: ctx.signal,
 			cwd: ctx.cwd,
