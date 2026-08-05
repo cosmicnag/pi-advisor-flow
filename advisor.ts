@@ -23,6 +23,7 @@
  * Install: `pi install https://github.com/hazrid93/pi-advisor` then `/reload`.
  */
 
+import { appendFileSync } from "node:fs";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -137,7 +138,9 @@ export default function (pi: ExtensionAPI) {
 		// enabling after it would lose the FIRST leaf turn AND the task prompt
 		// (which #captureNewUserMessages only reaches on an enabled turn — Blocker 1).
 		const hasTask = branchHasTaskStart(ctx);
-		console.log(`[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask} model=${!!config.advisorModel}`);
+		const logLine = `[pi-advisor] turn_end: armForTasks=${config.armForTasks} enabled=${config.enabled} hasTask=${hasTask} model=${!!config.advisorModel}`;
+		console.log(logLine);
+		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine + "\n"); } catch {}
 		if (config.armForTasks && !config.enabled && hasTask) {
 			config.enabled = true; // in-memory only; file keeps enabled: false
 			console.log(`[pi-advisor] armForTasks ENABLED`);
@@ -151,7 +154,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const rt = ensureRuntime(pi);
-		console.log(`[pi-advisor] turn_end: calling rt.onTurnEnd, runtime busy=${rt.isBusy}`);
+		const logLine2 = `[pi-advisor] turn_end: calling rt.onTurnEnd, runtime busy=${rt.isBusy}`;
+		console.log(logLine2);
+		try { appendFileSync("/tmp/pi-advisor-debug.log", logLine2 + "\n"); } catch {}
 		void rt.onTurnEnd(event.message, event.toolResults, ctx.sessionManager.getBranch(), {
 			signal: ctx.signal,
 			cwd: ctx.cwd,
