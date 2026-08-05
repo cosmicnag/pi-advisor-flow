@@ -372,6 +372,13 @@ export function normalizeConfig(raw: unknown): AdvisorConfig {
 	if (obj.instructionsMode === "global" || obj.instructionsMode === "none" || obj.instructionsMode === "project") {
 		base.instructionsMode = obj.instructionsMode;
 	}
+	// armForTasks invariant: the persisted `enabled` must be false while armed.
+	// The runtime sets enabled=true in-memory only; if that leaked to disk
+	// (e.g. via updateConfig or a manual edit), clamp it back so a main-session
+	// restart never resumes with the advisor active (Blocker 2).
+	if (base.armForTasks && base.enabled) {
+		base.enabled = false;
+	}
 	return base;
 }
 
